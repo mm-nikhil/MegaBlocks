@@ -1,0 +1,12 @@
+[submodule "third_party/megablocks"]
+	path = third_party/megablocks
+	url = https://github.com/databricks/megablocks.git
+
+[submodule "third_party/Nano-MoE-JAX"]
+	path = third_party/Nano-MoE-JAX
+	url = https://github.com/carrycooldude/Nano-MoE-JAX.git
+
+[submodule "third_party/grouped_gemm"]
+	path = third_party/grouped_gemm
+	url = https://github.com/tgale96/grouped_gemm.git
+	ignore = untracked
