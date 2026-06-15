@@ -10,7 +10,7 @@ implementation. PyTorch is the bridge to MegaBlocks.
 
 ## Boundary
 
-The profiled boundary is one MoE layer:
+The correctness boundary is one MoE layer:
 
 ```text
 input:  hidden states, shape (batch, seq_len, d_model)
@@ -21,11 +21,11 @@ extra:  scalar auxiliary load-balancing loss
 Inside the boundary:
 
 ```text
-router logits -> top-k expert ids -> gates -> expert FFNs -> weighted combine
+Nano layout adapter -> router logits -> top-k expert ids -> gates -> expert FFNs -> weighted combine -> Nano layout adapter
 ```
 
 The full Transformer block, attention layer, token embeddings, optimizer, and
-training loop are outside the current timing boundary.
+training loop are outside the current scope.
 
 ## Reference
 
@@ -35,24 +35,52 @@ It is written to match `third_party/Nano-MoE-JAX/nano_moe/layers.py`.
 Correctness is checked against real JAX execution before MegaBlocks timings are
 interpreted.
 
+Profiling weights default to `--weight-source nano_jax_init`, which initializes a
+real Nano-MoE-JAX `MoELayer` with Nano's Flax initializers and converts those
+parameters into PyTorch. Use `--weight-source synthetic` only for stress tests
+with simple `N(0, 0.02)` synthetic weights.
+
 ## MegaBlocks Mapping
 
 Matched:
 
 - Router weight layout.
-- Top-k expert ids.
-- Gate normalization.
+- Top-k expert ids from raw logits, matching Nano-MoE-JAX.
+- Gate normalization over selected logits.
+- Auxiliary load-balancing loss.
 - Expert weight layout.
 - GELU approximation.
 - Input/output layout conversion between Nano `(B, T, D)` and MegaBlocks `(T, B, D)`.
+
+The adapter computes Nano-compatible routing itself, then feeds the selected
+expert weights and indices into MegaBlocks' dispatch/expert/combine path. This is
+intentional: stock MegaBlocks takes top-k after the full softmax, while
+Nano-MoE-JAX takes top-k on raw logits. Those are equivalent in exact arithmetic
+but can differ for low-precision near-ties.
 
 Not matched by stock MegaBlocks:
 
 - Nano-MoE-JAX expert Dense layers have biases.
 - MegaBlocks expert MLPs are bias-free.
 
-Therefore current MegaBlocks timings use `--zero-expert-biases`. These timings
-represent a biasless NanoMoE MoE variant, not the exact default JAX layer.
+The profiling adapter now supports exact expert biases for the standard
+MegaBlocks MoE path:
+
+```text
+--megablocks-layer moe --use-expert-biases
+```
+
+This keeps MegaBlocks sorting, gathering, scattering, and combining, but replaces
+the stock bias-free expert MLP with a bias-aware batched MLP matching
+Nano-MoE-JAX when nonzero expert biases are present:
+
+```text
+x @ w1 + b1 -> GELU -> x @ w2 + b2
+```
+
+This is currently implemented only for standard `moe`, not grouped `dmoe`.
+When the actual expert biases are zero, as they are for Nano's default
+initializers, the stock MegaBlocks expert MLP is kept because it is already exact.
 
 ## GPU Execution
 
@@ -72,19 +100,18 @@ Trusted correctness smoke:
 ```text
 backend=megablocks
 megablocks_layer=moe
-dtype=float32
-zero_expert_biases=true
+dtype=float32,float16
+weight_source=nano_jax_init
+use_expert_biases=true
 ```
 
-Runs but not final-equivalence:
+Also validated for zero-bias Nano-initialized weights:
 
 ```text
-backend=megablocks, megablocks_layer=moe,  dtype=float16
 backend=megablocks, megablocks_layer=dmoe, dtype=bfloat16
 ```
 
-Those lower-precision runs execute on GPU, but current output checks show large
-max-error outliers even when mean error is small.
+`dmoe` still does not support nonzero Nano expert biases.
 
 Unsupported as a model dtype:
 
@@ -102,9 +129,40 @@ Timing metric:
 
 ```text
 mean_forward_ms
+std_forward_ms
+min_forward_ms
+max_forward_ms
 ```
 
-This is average forward-pass wall time measured with CUDA events after warmup.
+These are forward-pass wall times measured with CUDA events after warmup.
+
+For MegaBlocks, default timing scope is `megablocks_core`: Nano-compatible routing
+is prepared outside the timed region, then the timed callable runs MegaBlocks'
+dispatch/expert/combine path. This excludes the adapter's `(B, T, D)` layout
+conversion, router logits/top-k/gates, and auxiliary-loss bookkeeping.
+
+Use `--timing-scope adapter_boundary` only when intentionally timing the full
+Nano-compatible adapter boundary. Router diagnostics and expert-count histograms
+are always collected once after timing so they do not dominate nano-scale timings.
+
+Throughput and resource metrics:
+
+```text
+tokens_per_second
+peak_memory_allocated_bytes
+peak_memory_allocated_delta_bytes
+peak_memory_reserved_bytes
+active_expert_tflops_per_second
+backend_estimated_tflops_per_second
+tokens_per_expert_min
+tokens_per_expert_max
+```
+
+FLOP metrics are estimates. For the dense PyTorch reference, estimated backend
+FLOPs include all experts because the reference computes all expert outputs before
+selecting top-k. For MegaBlocks MoE, estimated backend FLOPs account for routed
+expert rows and standard-MoE padding. These estimates do not include softmax,
+top-k, layout copies, or auxiliary-loss bookkeeping.
 
 Output-check metrics:
 
@@ -113,17 +171,56 @@ max_abs_vs_reference
 mean_abs_vs_reference
 max_rel_vs_reference
 max_abs_reference
+aux_loss_reference
+aux_loss_actual
+aux_loss_abs_diff
+router_indices_equal
+router_index_mismatch_count
+router_expert_set_mismatch_count
+router_gate_max_abs
+router_gate_mean_abs
+router_gate_aligned_max_abs
+output_outlier_token_count
+max_abs_on_router_match_tokens
+max_abs_on_router_mismatch_tokens
+outlier_diagnosis
 ```
 
 Here `reference` is the PyTorch NanoMoE reference. `max` means the largest
 elementwise absolute difference across the output tensor.
 
+Router index mismatch is recorded positionally, and expert-set mismatch is
+recorded per token. Expert-set mismatch is what we use to identify actual
+router-choice flips, since a top-k order swap alone does not change the weighted
+expert set.
+
+`outlier_diagnosis` separates likely router-choice issues from numeric/expert-path
+issues:
+
+- `within_threshold`: max output difference is below threshold.
+- `router_choice_flip_at_max_error`: the token with largest error routed to a
+  different expert.
+- `router_choice_flips_elsewhere`: some router choices differ, but not at the max
+  error token.
+- `numeric_or_expert_path`: router choices match, so the error is likely numeric
+  precision or expert computation.
+
 ## Performance Mapping Plan
 
-Record a JSONL row for every benchmark run. Sweep:
+Record a JSONL row for every benchmark run. A sweep is still one MoE layer; the
+count is the number of benchmark configurations, not the number of model layers.
+
+Default sweep mode is focused: vary one axis at a time around a NanoMoE baseline,
+then compare `reference` vs `megablocks_moe`.
+
+Full Cartesian grid mode is available with `--preset grid`, but it is noisy and
+should be used only when we already know which axes are worth expanding.
+
+Sweep axes:
 
 - backend: reference, MegaBlocks MoE, MegaBlocks dMoE
 - dtype: float32, float16, bfloat16 where supported
+- weight source: Nano-JAX initialized weights by default, synthetic weights for stress tests
 - tokens: batch size times sequence length
 - model dimensions: `d_model`, `d_ff`
 - MoE parameters: `n_experts`, `top_k`

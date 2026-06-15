@@ -22,18 +22,25 @@ n_experts * sum_i(top1_token_fraction_i * mean_router_probability_i)
 
 ## Matching MegaBlocks
 
+The current adapter matches NanoMoE semantics first, then calls MegaBlocks'
+dispatch/expert/combine path.
+
 Matches:
 
-- Top-k expert indices match because softmax is monotonic in logits.
-- Gates match when MegaBlocks uses `moe_normalize_expert_weights=1`.
+- Top-k expert indices are computed from raw logits, matching NanoMoE.
+- Gates are `softmax(top_values)`, matching NanoMoE.
+- Auxiliary loss uses NanoMoE's top-1 load-balancing formula.
 - GELU matches with `torch.nn.functional.gelu(..., approximate="tanh")`.
 - Tensor layout maps from Nano `(B, T, D)` to MegaBlocks `(T, B, D)`.
+- Standard `moe` supports nonzero Nano expert biases through the local
+  bias-aware expert MLP adapter.
 
-Mismatches:
+Remaining limits:
 
-- Nano experts have per-expert Dense biases. MegaBlocks expert MLPs are bias-free.
-- Nano auxiliary loss uses only top-1 assignment. MegaBlocks load balancing counts
-  all top-k assignments and scales differently.
+- Grouped `dmoe` still does not support nonzero Nano expert biases.
+- Default profiling timing uses `megablocks_core`, so Nano-compatible routing is
+  prepared outside the timed region and the timed region is MegaBlocks
+  dispatch/expert/combine.
 
 ## Interpretation Rule
 
@@ -41,5 +48,5 @@ Only report a run as an exact Nano-MoE-JAX MoE implementation if:
 
 1. The PyTorch reference check passes.
 2. Expert bias semantics are matched or the tested weights have zero expert biases.
-3. Router gate normalization is configured to match NanoMoE.
+3. Router indices, gates, output, and auxiliary loss match the PyTorch reference.
 4. Dropout is disabled for deterministic forward timing.

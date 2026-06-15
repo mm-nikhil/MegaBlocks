@@ -20,26 +20,42 @@ run_profile() {
     "$@"
 }
 
-run_profile --label reference_fp16 --backend reference --device cuda --dtype float16
+run_profile \
+  --label reference_fp32_nano_init \
+  --backend reference \
+  --device cuda \
+  --dtype float32
 
 run_profile \
-  --label megablocks_moe_fp32 \
+  --label megablocks_moe_fp32_nano_init \
   --backend megablocks \
   --megablocks-layer moe \
-  --zero-expert-biases \
+  --use-expert-biases \
   --check-output \
   --dtype float32
 
 run_profile \
-  --label megablocks_moe_fp16 \
+  --label reference_fp16_nano_init \
+  --backend reference \
+  --device cuda \
+  --dtype float16
+
+run_profile \
+  --label megablocks_moe_fp16_nano_init \
   --backend megablocks \
   --megablocks-layer moe \
-  --zero-expert-biases \
+  --use-expert-biases \
   --check-output \
   --dtype float16
 
 run_profile \
-  --label megablocks_dmoe_bf16 \
+  --label reference_bf16_nano_init \
+  --backend reference \
+  --device cuda \
+  --dtype bfloat16
+
+run_profile \
+  --label megablocks_dmoe_bf16_nano_init \
   --backend megablocks \
   --megablocks-layer dmoe \
   --zero-expert-biases \

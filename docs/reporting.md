@@ -16,11 +16,22 @@ Each timing report should include enough metadata to reproduce the number.
 - Shape: batch, sequence length, token count, `d_model`, `d_ff`.
 - Experts: `n_experts`, `top_k`.
 - Dtype.
+- Weight source: `nano_jax_init` or `synthetic`.
+- Timing scope: `megablocks_core` or `adapter_boundary`.
 - Warmup iterations and measured iterations.
 - Mean forward time in milliseconds.
+- Trial count and forward-time standard deviation.
+- Tokens per second.
+- Peak allocated/reserved memory after warmup.
+- Approximate active-expert and backend-estimated TFLOP/s.
+- Tokens per expert min/max for MegaBlocks runs.
 - Whether output was checked against the PyTorch reference.
 - Output-check metrics: max absolute error, mean absolute error, max relative
   error, and max absolute reference value.
+- Aux-loss metrics: reference aux loss, actual aux loss, and absolute difference.
+- Router-check metrics: positional index mismatch, expert-set mismatch, and gate
+  differences.
+- Outlier diagnosis.
 - Whether expert biases were zeroed, matched, or intentionally mismatched.
 
 ## Minimal Result Template
@@ -41,10 +52,22 @@ backend:
 shape:
 experts:
 dtype:
+weight_source:
+timing_scope:
 warmup:
 iters:
 mean_forward_ms:
+std_forward_ms:
+tokens_per_second:
+active_expert_tflops_per_second:
+backend_estimated_tflops_per_second:
+peak_memory_allocated_bytes:
+peak_memory_allocated_delta_bytes:
+tokens_per_expert_max:
 output_check:
+aux_loss_check:
+router_check:
+outlier_diagnosis:
 bias_semantics:
 notes:
 ```
@@ -63,7 +86,7 @@ or for one run:
 .venv/bin/python src/profiling/profile_moe_layer.py \
   --backend megablocks \
   --megablocks-layer moe \
-  --zero-expert-biases \
+  --use-expert-biases \
   --check-output \
   --dtype float32 \
   --jsonl-out results/raw/my_run.jsonl
@@ -72,12 +95,25 @@ or for one run:
 Raw files under `results/raw/` are ignored by git. Promote only reviewed
 summaries into `results/`.
 
+For a configurable sweep:
+
+```bash
+.venv/bin/python src/profiling/sweep_moe_layer.py --help
+```
+
+For a compact comparison table:
+
+```bash
+.venv/bin/python src/profiling/summarize_moe_sweep.py results/raw/sweep.jsonl
+```
+
 ## Transparent Verification
 
 Attach or paste the output of:
 
 ```bash
 .venv/bin/python src/profiling/check_nano_moe_port.py
+.venv/bin/python src/profiling/verify_moe_layer.py
 .venv/bin/python - <<'PY'
 import torch
 print("torch", torch.__version__, "torch_cuda", torch.version.cuda)
