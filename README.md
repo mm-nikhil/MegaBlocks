@@ -52,5 +52,6 @@ See:
 
 - `docs/setup.md`
 - `docs/usage.md`
+- `docs/architecture.md`
 - `docs/terminology.md`
 - `docs/reporting.md`

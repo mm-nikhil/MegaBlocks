@@ -21,8 +21,11 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import time
+from datetime import datetime, timezone
 from functools import partial
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -48,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zero-expert-biases", action="store_true")
     parser.add_argument("--allow-bias-mismatch", action="store_true")
     parser.add_argument("--check-output", action="store_true")
+    parser.add_argument("--jsonl-out", type=Path)
+    parser.add_argument("--label", default="")
     return parser.parse_args()
 
 
@@ -120,6 +125,17 @@ def require_megablocks_runtime() -> None:
         )
 
 
+def gpu_metadata(device: torch.device) -> dict[str, object]:
+    if device.type != "cuda":
+        return {}
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return {
+        "gpu_name": torch.cuda.get_device_name(index),
+        "gpu_capability": list(torch.cuda.get_device_capability(index)),
+        "torch_cuda": torch.version.cuda,
+    }
+
+
 def build_megablocks_layer(
     args: argparse.Namespace,
     weights: NanoMoEWeights,
@@ -186,6 +202,7 @@ def main() -> None:
     dtype = parse_dtype(args.dtype)
     weights = make_random_weights(args, dtype, device)
     x = make_input(args, dtype, device)
+    check_metrics = {}
 
     if args.backend == "reference":
         def run():
@@ -218,15 +235,44 @@ def main() -> None:
                 actual = run().float()
                 diff = (expected - actual).abs()
                 ref_scale = expected.abs().max().clamp_min(1e-12)
-                print(f"max_abs_vs_reference: {diff.max().item():.6g}")
-                print(f"mean_abs_vs_reference: {diff.mean().item():.6g}")
-                print(f"max_rel_vs_reference: {(diff.max() / ref_scale).item():.6g}")
-                print(f"max_abs_reference: {expected.abs().max().item():.6g}")
+                check_metrics = {
+                    "max_abs_vs_reference": diff.max().item(),
+                    "mean_abs_vs_reference": diff.mean().item(),
+                    "max_rel_vs_reference": (diff.max() / ref_scale).item(),
+                    "max_abs_reference": expected.abs().max().item(),
+                }
+                for key, value in check_metrics.items():
+                    print(f"{key}: {value:.6g}")
 
     with torch.inference_mode():
         mean_ms = cuda_time_ms(run, warmup=args.warmup, iters=args.iters, device=device)
 
     tokens = args.batch_size * args.seq_len
+    record = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "label": args.label,
+        "backend": args.backend,
+        "megablocks_layer": args.megablocks_layer if args.backend == "megablocks" else None,
+        "device": str(device),
+        "dtype": args.dtype,
+        "batch_size": args.batch_size,
+        "seq_len": args.seq_len,
+        "tokens": tokens,
+        "d_model": args.d_model,
+        "d_ff": args.d_ff,
+        "n_experts": args.n_experts,
+        "top_k": args.top_k,
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "zero_expert_biases": args.zero_expert_biases,
+        "allow_bias_mismatch": args.allow_bias_mismatch,
+        "check_output": args.check_output,
+        "mean_forward_ms": mean_ms,
+        "torch": torch.__version__,
+        **gpu_metadata(device),
+        **check_metrics,
+    }
+
     print(f"backend: {args.backend}")
     if args.backend == "megablocks":
         print(f"megablocks_layer: {args.megablocks_layer}")
@@ -235,6 +281,11 @@ def main() -> None:
     print(f"shape: batch={args.batch_size} seq={args.seq_len} tokens={tokens} d_model={args.d_model}")
     print(f"experts: n={args.n_experts} top_k={args.top_k} d_ff={args.d_ff}")
     print(f"mean_forward_ms: {mean_ms:.4f}")
+    if args.jsonl_out is not None:
+        args.jsonl_out.parent.mkdir(parents=True, exist_ok=True)
+        with args.jsonl_out.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        print(f"wrote_jsonl: {args.jsonl_out}")
 
 
 if __name__ == "__main__":

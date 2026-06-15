@@ -35,6 +35,15 @@ and timing harness behavior, but it is not MegaBlocks performance.
   --dtype float16
 ```
 
+To run the current smoke matrix and store JSONL:
+
+```bash
+scripts/run_smoke_matrix.sh
+```
+
+The script writes to `results/raw/...jsonl` by default. Raw files are ignored by
+git; promote curated summaries into `results/`.
+
 ## MegaBlocks Timing
 
 After `megablocks_ops` and `grouped_gemm` are built:

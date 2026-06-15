@@ -49,6 +49,29 @@ bias_semantics:
 notes:
 ```
 
+## Raw Sweep Capture
+
+Use JSONL for raw benchmark capture:
+
+```bash
+scripts/run_smoke_matrix.sh
+```
+
+or for one run:
+
+```bash
+.venv/bin/python src/profiling/profile_moe_layer.py \
+  --backend megablocks \
+  --megablocks-layer moe \
+  --zero-expert-biases \
+  --check-output \
+  --dtype float32 \
+  --jsonl-out results/raw/my_run.jsonl
+```
+
+Raw files under `results/raw/` are ignored by git. Promote only reviewed
+summaries into `results/`.
+
 ## Transparent Verification
 
 Attach or paste the output of:
