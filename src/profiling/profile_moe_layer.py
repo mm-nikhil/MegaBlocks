@@ -7,8 +7,8 @@ Backends:
 
     megablocks:
         MegaBlocks MoE/dMoE adapter. This requires compiled MegaBlocks kernels.
-        It refuses nonzero Nano expert biases by default because MegaBlocks expert
-        MLPs do not model the per-expert Dense biases used by Nano-MoE-JAX.
+        It refuses nonzero Nano expert biases by default. Use --use-expert-biases
+        to install a Nano-compatible expert MLP wrapper for standard MoE or dMoE.
 
 Example:
     python src/profiling/profile_moe_layer.py --backend reference --device cuda
@@ -312,6 +312,55 @@ class NanoMoEBiasedBatchedMLP(torch.nn.Module):
         return x + self.b2[:, None, :]
 
 
+class NanoMoEBiasedGroupedMLP(torch.nn.Module):
+    """Bias-aware expert MLP for MegaBlocks dMoE grouped layout.
+
+    dMoE gathers all routed token/expert assignments into one 2D tensor sorted by
+    expert, then runs grouped GEMMs using ``tokens_per_expert``. This wrapper
+    preserves that path and injects Nano-MoE-JAX's per-expert Dense biases after
+    the first grouped GEMM and after the second grouped GEMM.
+    """
+
+    def __init__(self, weights: NanoMoEWeights):
+        super().__init__()
+        self.n_experts = weights.n_experts
+        self.d_model = weights.d_model
+        self.d_ff = weights.d_ff
+        self.w1 = torch.nn.Parameter(
+            weights.w1.transpose(1, 2).contiguous().view(-1, weights.d_model),
+        )
+        self.b1 = torch.nn.Parameter(weights.b1.contiguous())
+        self.w2 = torch.nn.Parameter(weights.w2.contiguous().view(-1, weights.d_model))
+        self.b2 = torch.nn.Parameter(weights.b2.contiguous())
+
+    def _expert_ids(
+        self,
+        tokens_per_expert: torch.Tensor,
+        total_rows: int,
+    ) -> torch.Tensor:
+        experts = torch.arange(self.n_experts, device=tokens_per_expert.device, dtype=torch.long)
+        return torch.repeat_interleave(
+            experts,
+            tokens_per_expert.to(torch.long),
+            output_size=total_rows,
+        )
+
+    def forward(self, x: torch.Tensor, tokens_per_expert: torch.Tensor) -> torch.Tensor:
+        from megablocks import grouped_gemm_util as gg
+
+        batch_sizes = tokens_per_expert.cpu().to(torch.long)
+        expert_ids = self._expert_ids(tokens_per_expert, x.shape[0])
+        w1 = self.w1.view(self.n_experts, self.d_ff, self.d_model)
+        w2 = self.w2.view(self.n_experts, self.d_ff, self.d_model)
+
+        assert gg.ops is not None
+        x = gg.ops.gmm(x, w1, batch_sizes, trans_b=True)
+        x = x + self.b1.index_select(0, expert_ids)
+        x = F.gelu(x, approximate="tanh")
+        x = gg.ops.gmm(x, w2, batch_sizes)
+        return x + self.b2.index_select(0, expert_ids)
+
+
 @dataclass(frozen=True)
 class MegaBlocksForward:
     output: torch.Tensor
@@ -338,8 +387,12 @@ def build_megablocks_layer(
     device: torch.device,
 ) -> torch.nn.Module:
     require_megablocks_runtime()
-    if args.use_expert_biases and args.megablocks_layer != "moe":
-        raise RuntimeError("--use-expert-biases is currently implemented only for --megablocks-layer moe.")
+    if args.megablocks_layer == "dmoe" and dtype != torch.bfloat16:
+        raise RuntimeError(
+            "MegaBlocks dMoE uses the grouped_gemm extension in this checkout, "
+            "and that extension currently requires bfloat16 inputs. Use "
+            "--dtype bfloat16 for --megablocks-layer dmoe."
+        )
     if weights.max_abs_bias() != 0.0 and not args.use_expert_biases and not args.allow_bias_mismatch:
         raise RuntimeError(
             "Nano-MoE-JAX experts include per-expert Dense biases, but MegaBlocks "
@@ -382,7 +435,10 @@ def build_megablocks_layer(
             # Keep the stock MegaBlocks expert MLP when biases are zero. The
             # bias-aware replacement is only needed for trained/synthetic weights
             # with nonzero Nano Dense biases.
-            layer.experts.mlp = NanoMoEBiasedBatchedMLP(weights)
+            if args.megablocks_layer == "dmoe":
+                layer.experts.mlp = NanoMoEBiasedGroupedMLP(weights)
+            else:
+                layer.experts.mlp = NanoMoEBiasedBatchedMLP(weights)
             layer.experts.mlp.eval()
         elif args.megablocks_layer == "dmoe":
             layer.experts.mlp.w1.view(args.n_experts, args.d_ff, args.d_model).copy_(

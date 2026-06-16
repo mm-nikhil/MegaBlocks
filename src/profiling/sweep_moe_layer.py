@@ -27,12 +27,40 @@ FOCUSED_BASELINE = {
 }
 
 
+def focused_baseline_from_axes(
+    *,
+    tokens_grid: list[int],
+    d_model_grid: list[int],
+    d_ff_grid: list[int],
+    n_expert_grid: list[int],
+    top_k_grid: list[int],
+    dtype_grid: list[str],
+) -> dict[str, int | str]:
+    baseline = dict(FOCUSED_BASELINE)
+    axes = [
+        ("tokens", tokens_grid),
+        ("d_model", d_model_grid),
+        ("d_ff", d_ff_grid),
+        ("n_experts", n_expert_grid),
+        ("top_k", top_k_grid),
+        ("dtype", dtype_grid),
+    ]
+    for axis_name, values in axes:
+        if len(values) == 1:
+            baseline[axis_name] = values[0]
+    return baseline
+
+
 def parse_csv_ints(value: str) -> list[int]:
     return [int(item) for item in value.split(",") if item]
 
 
 def parse_csv_strings(value: str) -> list[str]:
     return [item for item in value.split(",") if item]
+
+
+def label_value(value: str) -> str:
+    return value.replace(":", "").replace("/", "_")
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +79,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-ks", default="1,2")
     parser.add_argument("--dtypes", default="float32,float16,bfloat16")
     parser.add_argument("--backends", default="reference,megablocks_moe")
+    parser.add_argument(
+        "--dmoe-bias-mode",
+        choices=("zero", "matched", "mismatch"),
+        default="zero",
+        help=(
+            "Bias handling for megablocks_dmoe rows: zero is the current exact "
+            "biasless dMoE benchmark, matched uses the bias-aware dMoE adapter, "
+            "and mismatch times known-non-equivalent bias-free dMoE."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
@@ -72,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def backend_args(backend: str) -> list[str]:
+def backend_args(backend: str, *, dmoe_bias_mode: str = "zero") -> list[str]:
     if backend == "reference":
         return ["--backend", "reference"]
     if backend == "megablocks_moe":
@@ -85,14 +123,22 @@ def backend_args(backend: str) -> list[str]:
             "--check-output",
         ]
     if backend == "megablocks_dmoe":
-        return [
+        args = [
             "--backend",
             "megablocks",
             "--megablocks-layer",
             "dmoe",
-            "--zero-expert-biases",
             "--check-output",
         ]
+        if dmoe_bias_mode == "zero":
+            args.append("--zero-expert-biases")
+        elif dmoe_bias_mode == "matched":
+            args.append("--use-expert-biases")
+        elif dmoe_bias_mode == "mismatch":
+            args.append("--allow-bias-mismatch")
+        else:
+            raise ValueError(f"Unsupported dMoE bias mode: {dmoe_bias_mode}")
+        return args
     raise ValueError(f"Unsupported backend: {backend}")
 
 
@@ -152,7 +198,14 @@ def focused_configs(
 ) -> list[Config]:
     configs = []
     seen = set()
-    baseline = FOCUSED_BASELINE
+    baseline = focused_baseline_from_axes(
+        tokens_grid=tokens_grid,
+        d_model_grid=d_model_grid,
+        d_ff_grid=d_ff_grid,
+        n_expert_grid=n_expert_grid,
+        top_k_grid=top_k_grid,
+        dtype_grid=dtype_grid,
+    )
 
     axes = [
         ("tokens", tokens_grid),
@@ -289,18 +342,26 @@ def main() -> None:
     print(f"sweep_configs={len(configs)}")
     print(f"jsonl_out={args.jsonl_out}")
     if args.preset == "focused":
-        print("focused_baseline=" + ",".join(f"{key}={value}" for key, value in FOCUSED_BASELINE.items()))
+        baseline = focused_baseline_from_axes(
+            tokens_grid=tokens_grid,
+            d_model_grid=d_model_grid,
+            d_ff_grid=d_ff_grid,
+            n_expert_grid=n_expert_grid,
+            top_k_grid=top_k_grid,
+            dtype_grid=dtype_grid,
+        )
+        print("focused_baseline=" + ",".join(f"{key}={value}" for key, value in baseline.items()))
 
     script = Path(__file__).with_name("profile_moe_layer.py")
     for index, (tokens, batch_size, d_model, d_ff, n_experts, top_k, dtype, backend) in enumerate(configs, start=1):
         label = (
-            f"{backend}_tok{tokens}_d{d_model}_ff{d_ff}_"
+            f"{backend}_{label_value(args.device)}_tok{tokens}_d{d_model}_ff{d_ff}_"
             f"e{n_experts}_k{top_k}_{dtype}_{args.weight_source}"
         )
         cmd = [
             sys.executable,
             str(script),
-            *backend_args(backend),
+            *backend_args(backend, dmoe_bias_mode=args.dmoe_bias_mode),
             "--batch-size",
             str(batch_size),
             "--seq-len",

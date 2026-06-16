@@ -10,6 +10,7 @@ from typing import Iterable
 
 
 CONFIG_KEYS = ("tokens", "d_model", "d_ff", "n_experts", "top_k", "dtype", "weight_source")
+LABEL_KEYS = (*CONFIG_KEYS, "backend_variant", "device")
 
 
 def parse_csv_strings(value: str | None) -> set[str] | None:
@@ -25,6 +26,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtypes", help="Comma-separated dtype filter.")
     parser.add_argument("--max-rows", type=int, default=80)
     parser.add_argument("--all-runs", action="store_true", help="Do not collapse repeated labels to the latest run.")
+    parser.add_argument(
+        "--reference-device",
+        help=(
+            "Device for speedup denominator. Defaults to cuda when both cuda and "
+            "cpu reference rows are present."
+        ),
+    )
     parser.add_argument("--show-throughput", action="store_true")
     return parser.parse_args()
 
@@ -36,7 +44,7 @@ def load_rows(path: Path, *, latest_per_label: bool) -> list[dict]:
             if not line.strip():
                 continue
             row = json.loads(line)
-            label = row.get("label") or json.dumps({key: row.get(key) for key in CONFIG_KEYS}, sort_keys=True)
+            label = row.get("label") or json.dumps({key: row.get(key) for key in LABEL_KEYS}, sort_keys=True)
             if label in rows_by_label:
                 del rows_by_label[label]
             rows_by_label[label] = row
@@ -62,14 +70,32 @@ def sort_key(row: dict) -> tuple:
         row.get("top_k", 0),
         row.get("dtype", ""),
         row.get("weight_source", ""),
+        row.get("device", ""),
         row.get("backend_variant", row.get("backend", "")),
     )
 
 
-def reference_times(rows: Iterable[dict]) -> dict[tuple, float]:
+def is_reference(row: dict) -> bool:
+    return row.get("backend_variant") == "reference" or row.get("backend") == "reference"
+
+
+def device_name(row: dict) -> str:
+    return str(row.get("device", "unknown"))
+
+
+def resolve_reference_device(rows: Iterable[dict], requested: str | None) -> str | None:
+    if requested is not None:
+        return requested
+    devices = sorted({device_name(row) for row in rows if is_reference(row)})
+    if "cuda" in devices:
+        return "cuda"
+    return devices[0] if devices else None
+
+
+def reference_times(rows: Iterable[dict], *, reference_device: str | None) -> dict[tuple, float]:
     refs = {}
     for row in rows:
-        if row.get("backend_variant") == "reference" or row.get("backend") == "reference":
+        if is_reference(row) and (reference_device is None or device_name(row) == reference_device):
             refs[config_key(row)] = float(row["mean_forward_ms"])
     return refs
 
@@ -113,6 +139,7 @@ def table_row(row: dict, refs: dict[tuple, float], *, show_throughput: bool) -> 
         str(row.get("dtype", "-")),
         str(row.get("weight_source", "-")),
         str(row.get("backend_variant", row.get("backend", "-"))),
+        str(row.get("device", "-")),
         fmt_float(row.get("mean_forward_ms"), 4),
         fmt_float(row.get("std_forward_ms"), 4),
         fmt_float(speedup, 2),
@@ -127,8 +154,8 @@ def table_row(row: dict, refs: dict[tuple, float], *, show_throughput: bool) -> 
     return values
 
 
-def print_table(rows: list[dict], *, show_throughput: bool) -> None:
-    refs = reference_times(rows)
+def print_table(rows: list[dict], *, reference_device: str | None, show_throughput: bool) -> None:
+    refs = reference_times(rows, reference_device=reference_device)
     headers = [
         "tokens",
         "d",
@@ -138,6 +165,7 @@ def print_table(rows: list[dict], *, show_throughput: bool) -> None:
         "dtype",
         "weights",
         "backend",
+        "device",
         "ms",
         "std",
         "speedup",
@@ -172,8 +200,10 @@ def main() -> None:
     if args.max_rows is not None:
         rows = rows[:args.max_rows]
 
+    reference_device = resolve_reference_device(rows, args.reference_device)
     print(f"rows={len(rows)} source={args.jsonl}")
-    print_table(rows, show_throughput=args.show_throughput)
+    print(f"speedup_reference_device={reference_device}")
+    print_table(rows, reference_device=reference_device, show_throughput=args.show_throughput)
 
 
 if __name__ == "__main__":

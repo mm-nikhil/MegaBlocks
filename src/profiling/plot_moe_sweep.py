@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 
 
 CONFIG_KEYS = ("tokens", "d_model", "d_ff", "n_experts", "top_k", "dtype", "weight_source")
+LABEL_KEYS = (*CONFIG_KEYS, "backend_variant", "device")
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=2)
     parser.add_argument("--dtype", default="float32")
     parser.add_argument("--weight-source", default="nano_jax_init")
+    parser.add_argument(
+        "--series-label",
+        choices=("auto", "backend", "backend_device"),
+        default="auto",
+        help="Use backend_device for combined CPU/GPU plots.",
+    )
+    parser.add_argument(
+        "--reference-device",
+        help=(
+            "Device for speedup denominator. Defaults to cuda when both cuda and "
+            "cpu reference rows are present."
+        ),
+    )
     parser.add_argument("--latest-per-label", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--min-points", type=int, default=2, help="Minimum distinct x-axis values required.")
     parser.add_argument("--formats", default="png", help="Comma-separated output formats, e.g. png,pdf.")
@@ -79,7 +93,7 @@ def load_rows(path: Path, *, latest_per_label: bool) -> list[dict]:
     by_label: OrderedDict[str, dict] = OrderedDict()
     for row in rows:
         label = row.get("label") or json.dumps(
-            {key: row.get(key) for key in (*CONFIG_KEYS, "backend_variant")},
+            {key: row.get(key) for key in LABEL_KEYS},
             sort_keys=True,
         )
         if label in by_label:
@@ -90,6 +104,28 @@ def load_rows(path: Path, *, latest_per_label: bool) -> list[dict]:
 
 def backend_name(row: dict) -> str:
     return str(row.get("backend_variant", row.get("backend", "unknown")))
+
+
+def device_name(row: dict) -> str:
+    return str(row.get("device", "unknown"))
+
+
+def is_reference(row: dict) -> bool:
+    return backend_name(row) == "reference"
+
+
+def label_mode(rows: Iterable[dict], requested: str) -> str:
+    if requested != "auto":
+        return requested
+    devices = {device_name(row) for row in rows}
+    return "backend_device" if len(devices) > 1 else "backend"
+
+
+def series_name(row: dict, mode: str) -> str:
+    name = backend_name(row)
+    if mode == "backend_device":
+        return f"{name}_{device_name(row)}"
+    return name
 
 
 def config_key(row: dict) -> tuple:
@@ -122,30 +158,44 @@ def rows_for_plot(rows: Iterable[dict], spec: PlotSpec, filters: dict[str, objec
     ]
 
 
-def grouped_points(rows: Iterable[dict], axis_key: str) -> dict[str, list[tuple[float, float]]]:
+def grouped_points(rows: Iterable[dict], axis_key: str, mode: str) -> dict[str, list[tuple[float, float]]]:
     groups: dict[str, list[tuple[float, float]]] = defaultdict(list)
     for row in rows:
-        groups[backend_name(row)].append((float(row[axis_key]), float(row["mean_forward_ms"])))
+        groups[series_name(row, mode)].append((float(row[axis_key]), float(row["mean_forward_ms"])))
     return {
         name: sorted(points)
         for name, points in sorted(groups.items())
     }
 
 
-def reference_times(rows: Iterable[dict]) -> dict[tuple, float]:
+def resolve_reference_device(rows: Iterable[dict], requested: str | None) -> str | None:
+    if requested is not None:
+        return requested
+    devices = sorted({device_name(row) for row in rows if is_reference(row)})
+    if "cuda" in devices:
+        return "cuda"
+    return devices[0] if devices else None
+
+
+def reference_times(rows: Iterable[dict], *, reference_device: str | None) -> dict[tuple, float]:
     refs = {}
     for row in rows:
-        if backend_name(row) == "reference":
+        if is_reference(row) and (reference_device is None or device_name(row) == reference_device):
             refs[config_key(row)] = float(row["mean_forward_ms"])
     return refs
 
 
-def speedup_points(rows: Iterable[dict], axis_key: str, refs: dict[tuple, float]) -> dict[str, list[tuple[float, float]]]:
+def speedup_points(
+    rows: Iterable[dict],
+    axis_key: str,
+    refs: dict[tuple, float],
+    mode: str,
+) -> dict[str, list[tuple[float, float]]]:
     groups: dict[str, list[tuple[float, float]]] = defaultdict(list)
     for row in rows:
-        name = backend_name(row)
-        if name == "reference":
+        if is_reference(row):
             continue
+        name = series_name(row, mode)
         ref_ms = refs.get(config_key(row))
         if ref_ms is None:
             continue
@@ -198,13 +248,17 @@ def main() -> None:
     args = parse_args()
     rows = load_rows(args.jsonl, latest_per_label=args.latest_per_label)
     filters = base_filters(args)
+    mode = label_mode(rows, args.series_label)
+    reference_device = resolve_reference_device(rows, args.reference_device)
     formats = [item for item in args.formats.split(",") if item]
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    refs = reference_times(rows)
+    refs = reference_times(rows, reference_device=reference_device)
     manifest = {
         "source": str(args.jsonl),
         "filters": filters,
+        "series_label": mode,
+        "reference_device": reference_device,
         "plots": [],
     }
 
@@ -215,7 +269,7 @@ def main() -> None:
             continue
 
         latency_paths = save_line_plot(
-            groups=grouped_points(plot_rows, spec.axis_key),
+            groups=grouped_points(plot_rows, spec.axis_key, mode),
             title=f"MoE latency vs {spec.xlabel}",
             xlabel=spec.xlabel,
             ylabel="mean forward time (ms)",
@@ -223,8 +277,8 @@ def main() -> None:
             formats=formats,
         )
         speedup_paths = save_line_plot(
-            groups=speedup_points(plot_rows, spec.axis_key, refs),
-            title=f"MegaBlocks speedup vs reference by {spec.xlabel}",
+            groups=speedup_points(plot_rows, spec.axis_key, refs, mode),
+            title=f"MegaBlocks speedup vs {reference_device or 'reference'} reference by {spec.xlabel}",
             xlabel=spec.xlabel,
             ylabel="reference ms / backend ms",
             out_base=args.out_dir / f"speedup_vs_{spec.filename_key}",

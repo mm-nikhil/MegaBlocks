@@ -12,13 +12,15 @@
     {
       "axis": "tokens",
       "latency": [
-        "results/plots/rtx3080_nano_token_sweep_20260615/latency_vs_tokens.png"
+        "latency_vs_tokens.png"
       ],
-      "points": 12,
+      "points": 18,
       "speedup": [
-        "results/plots/rtx3080_nano_token_sweep_20260615/speedup_vs_tokens.png"
+        "speedup_vs_tokens.png"
       ]
     }
   ],
-  "source": "results/raw/rtx3080_nano_token_sweep_20260615.jsonl"
+  "reference_device": "cuda",
+  "series_label": "backend_device",
+  "source": "results/raw/rtx3080_nano_token_sweep_with_cpu_20260616.jsonl"
 }

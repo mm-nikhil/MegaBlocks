@@ -40,10 +40,12 @@ rows:
   reference on the smoke shape.
 - `megablocks/dmoe`, bfloat16, zero expert biases: exact agreement with the
   PyTorch Nano reference on the smoke shape.
+- `megablocks/dmoe`, bfloat16, synthetic nonzero expert biases: exact agreement
+  with the PyTorch Nano reference through the bias-aware grouped adapter.
 
 Still under investigation:
 
-- Nonzero expert-bias support for grouped `dmoe`.
+- FP16/FP32 grouped `dmoe`; the current grouped GEMM extension requires BF16.
 - Broader plotted sweeps over larger shapes and checkpoint-like activation/weight
   distributions.
 
@@ -57,9 +59,9 @@ python src/profiling/verify_moe_layer.py
 
 See:
 
+- `Findings.md`
 - `docs/setup.md`
 - `docs/usage.md`
 - `docs/architecture.md`
 - `docs/terminology.md`
-- `docs/performance_mapping_plan.md`
 - `docs/reporting.md`

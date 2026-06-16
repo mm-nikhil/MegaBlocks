@@ -93,6 +93,14 @@ Summarize the JSONL as a compact table:
 .venv/bin/python src/profiling/summarize_moe_sweep.py results/raw/sweep.jsonl
 ```
 
+For mixed CPU/GPU JSONL files, set the speedup denominator explicitly:
+
+```bash
+.venv/bin/python src/profiling/summarize_moe_sweep.py \
+  results/raw/sweep_with_cpu.jsonl \
+  --reference-device cuda
+```
+
 Use `--show-throughput` only when you explicitly want tokens/sec and estimated
 TFLOP/s columns. The default table focuses on latency and correctness.
 
@@ -104,6 +112,46 @@ Generate latency and speedup plots:
   --out-dir results/plots/sweep \
   --dtype float32
 ```
+
+## CPU Reference Rows
+
+CPU rows should use the PyTorch `reference` backend, not direct JAX timing. This
+keeps the CPU and GPU reference rows on the same PyTorch NanoMoE implementation
+and isolates the device difference.
+
+Run a CPU reference sweep into the same JSONL as the CUDA sweep:
+
+```bash
+.venv/bin/python src/profiling/sweep_moe_layer.py \
+  --tokens 4096,8192,16384 \
+  --seq-len 128 \
+  --d-models 128 \
+  --d-ffs 512 \
+  --n-experts 4 \
+  --top-ks 2 \
+  --dtypes float32 \
+  --backends reference \
+  --device cpu \
+  --warmup 3 \
+  --iters 10 \
+  --trials 2 \
+  --jsonl-out results/raw/sweep_with_cpu.jsonl
+```
+
+Then plot combined CPU/GPU latency lines:
+
+```bash
+.venv/bin/python src/profiling/plot_moe_sweep.py \
+  results/raw/sweep_with_cpu.jsonl \
+  --out-dir results/plots/sweep_with_cpu \
+  --dtype float32 \
+  --series-label backend_device \
+  --reference-device cuda
+```
+
+The latency plot can show `reference_cpu`, `reference_cuda`, and
+`megablocks_moe_cuda`. Speedup plots use the selected reference device as the
+denominator; for GPU backend comparisons, use `--reference-device cuda`.
 
 Use `--dry-run` to inspect commands and `--limit N` for a small test. Use
 `--preset grid` only for a deliberate full Cartesian sweep.
@@ -153,6 +201,22 @@ Dropless grouped dMoE with Nano-JAX initialized zero expert biases:
   --zero-expert-biases \
   --check-output
 ```
+
+Dropless grouped dMoE with synthetic nonzero expert biases:
+
+```bash
+.venv/bin/python src/profiling/profile_moe_layer.py \
+  --backend megablocks \
+  --megablocks-layer dmoe \
+  --dtype bfloat16 \
+  --weight-source synthetic \
+  --use-expert-biases \
+  --check-output
+```
+
+`dmoe` currently requires `--dtype bfloat16` because the local grouped GEMM
+extension asserts BF16 inputs. Use `sweep_moe_layer.py --dmoe-bias-mode matched`
+to include matched-bias dMoE rows in a synthetic or checkpoint-style sweep.
 
 BF16:
 

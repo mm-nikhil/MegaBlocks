@@ -34,10 +34,15 @@ Matches:
 - Tensor layout maps from Nano `(B, T, D)` to MegaBlocks `(T, B, D)`.
 - Standard `moe` supports nonzero Nano expert biases through the local
   bias-aware expert MLP adapter.
+- Grouped `dmoe` supports nonzero Nano expert biases through the local BF16
+  bias-aware grouped MLP adapter.
 
 Remaining limits:
 
-- Grouped `dmoe` still does not support nonzero Nano expert biases.
+- Grouped `dmoe` FP16/FP32 rows are unsupported by the current grouped GEMM
+  extension.
+- BF16 rows may need a dtype-specific numeric tolerance for expert-path
+  differences.
 - Default profiling timing uses `megablocks_core`, so Nano-compatible routing is
   prepared outside the timed region and the timed region is MegaBlocks
   dispatch/expert/combine.

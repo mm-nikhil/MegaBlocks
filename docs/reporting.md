@@ -13,6 +13,7 @@ Each timing report should include enough metadata to reproduce the number.
 - Nano-MoE-JAX commit.
 - Command line used.
 - Backend: `reference`, `megablocks/moe`, or `megablocks/dmoe`.
+- Device: `cpu`, `cuda`, or explicit CUDA device.
 - Shape: batch, sequence length, token count, `d_model`, `d_ff`.
 - Experts: `n_experts`, `top_k`.
 - Dtype.
@@ -49,6 +50,7 @@ grouped_gemm_commit:
 nano_moe_jax_commit:
 command:
 backend:
+device:
 shape:
 experts:
 dtype:

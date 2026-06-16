@@ -63,24 +63,30 @@ Not matched by stock MegaBlocks:
 - Nano-MoE-JAX expert Dense layers have biases.
 - MegaBlocks expert MLPs are bias-free.
 
-The profiling adapter now supports exact expert biases for the standard
-MegaBlocks MoE path:
+The profiling adapter supports Nano expert biases for the standard MegaBlocks
+MoE path and for BF16 grouped dMoE:
 
 ```text
 --megablocks-layer moe --use-expert-biases
+--megablocks-layer dmoe --dtype bfloat16 --use-expert-biases
 ```
 
 This keeps MegaBlocks sorting, gathering, scattering, and combining, but replaces
-the stock bias-free expert MLP with a bias-aware batched MLP matching
-Nano-MoE-JAX when nonzero expert biases are present:
+the stock bias-free expert MLP with a bias-aware adapter matching Nano-MoE-JAX
+when nonzero expert biases are present:
 
 ```text
 x @ w1 + b1 -> GELU -> x @ w2 + b2
 ```
 
-This is currently implemented only for standard `moe`, not grouped `dmoe`.
+For standard `moe`, the adapter uses a bias-aware batched MLP. For grouped
+`dmoe`, the adapter uses grouped GEMMs and adds `b1`/`b2` in the grouped routed
+layout. The current grouped GEMM extension accepts BF16 inputs only, so dMoE
+FP16/FP32 rows are unsupported in this checkout.
+
 When the actual expert biases are zero, as they are for Nano's default
-initializers, the stock MegaBlocks expert MLP is kept because it is already exact.
+initializers, the stock MegaBlocks expert MLP is kept because it is already exact
+for that bias term.
 
 ## GPU Execution
 
@@ -111,7 +117,15 @@ Also validated for zero-bias Nano-initialized weights:
 backend=megablocks, megablocks_layer=dmoe, dtype=bfloat16
 ```
 
-`dmoe` still does not support nonzero Nano expert biases.
+Also validated for synthetic nonzero expert biases:
+
+```text
+backend=megablocks, megablocks_layer=dmoe, dtype=bfloat16, use_expert_biases=true
+```
+
+BF16 rows can still show small numeric/expert-path differences against the dense
+PyTorch reference on some shapes. These are recorded in the sweep output and
+should be reported separately from routing correctness.
 
 Unsupported as a model dtype:
 
@@ -205,7 +219,7 @@ issues:
 - `numeric_or_expert_path`: router choices match, so the error is likely numeric
   precision or expert computation.
 
-## Performance Mapping Plan
+## Benchmarking Model
 
 Record a JSONL row for every benchmark run. A sweep is still one MoE layer; the
 count is the number of benchmark configurations, not the number of model layers.
