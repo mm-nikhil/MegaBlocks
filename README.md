@@ -3,9 +3,9 @@
 This repo profiles MegaBlocks MoE execution against the MoE layer semantics used by
 Nano-MoE-JAX.
 
-The goal is not to rewrite Nano-MoE-JAX casually. The first-class check is semantic:
-the PyTorch reference in `src/profiling` must match Nano-MoE-JAX at the MoE boundary
-before MegaBlocks timings are interpreted.
+Semantic checks come before timing interpretation. The PyTorch reference in
+`src/profiling` matches Nano-MoE-JAX at the MoE boundary, then the MegaBlocks
+adapter is checked against that reference.
 
 ## Layout
 
@@ -44,7 +44,7 @@ rows:
 Still under investigation:
 
 - Nonzero expert-bias support for grouped `dmoe`.
-- Broader sweeps over larger shapes and checkpoint-like activation/weight
+- Broader plotted sweeps over larger shapes and checkpoint-like activation/weight
   distributions.
 
 Start with:
@@ -61,4 +61,5 @@ See:
 - `docs/usage.md`
 - `docs/architecture.md`
 - `docs/terminology.md`
+- `docs/performance_mapping_plan.md`
 - `docs/reporting.md`

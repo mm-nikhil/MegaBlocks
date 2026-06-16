@@ -8,6 +8,7 @@ python -m pip install --upgrade pip
 python -m pip install "setuptools<79.0.0" wheel ninja
 python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu126
 python -m pip install "numpy>=1.21.5,<2.1.0" "packaging>=21.3.0,<24.2"
+python -m pip install "matplotlib>=3.8,<3.10"
 python -m pip install jax==0.4.35 jaxlib==0.4.35 pytest
 python -m pip install --no-deps flax==0.8.4
 python -m pip install msgpack PyYAML rich absl-py

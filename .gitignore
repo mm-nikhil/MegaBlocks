@@ -11,10 +11,10 @@ dist/
 .ruff_cache/
 
 results/raw/
-results/*.jsonl
-results/*.csv
-results/*.pt
-results/*.npz
+# results/*.jsonl
+# results/*.csv
+# results/*.pt
+# results/*.npz
 
 third_party/**/build/
 third_party/**/*.egg-info/

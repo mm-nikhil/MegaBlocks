@@ -1,0 +1,24 @@
+{
+  "filters": {
+    "d_ff": 512,
+    "d_model": 128,
+    "dtype": "float32",
+    "n_experts": 4,
+    "tokens": 4096,
+    "top_k": 2,
+    "weight_source": "nano_jax_init"
+  },
+  "plots": [
+    {
+      "axis": "tokens",
+      "latency": [
+        "results/plots/rtx3080_nano_token_sweep_20260615/latency_vs_tokens.png"
+      ],
+      "points": 12,
+      "speedup": [
+        "results/plots/rtx3080_nano_token_sweep_20260615/speedup_vs_tokens.png"
+      ]
+    }
+  ],
+  "source": "results/raw/rtx3080_nano_token_sweep_20260615.jsonl"
+}

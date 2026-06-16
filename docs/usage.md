@@ -96,6 +96,15 @@ Summarize the JSONL as a compact table:
 Use `--show-throughput` only when you explicitly want tokens/sec and estimated
 TFLOP/s columns. The default table focuses on latency and correctness.
 
+Generate latency and speedup plots:
+
+```bash
+.venv/bin/python src/profiling/plot_moe_sweep.py \
+  results/raw/sweep.jsonl \
+  --out-dir results/plots/sweep \
+  --dtype float32
+```
+
 Use `--dry-run` to inspect commands and `--limit N` for a small test. Use
 `--preset grid` only for a deliberate full Cartesian sweep.
 
