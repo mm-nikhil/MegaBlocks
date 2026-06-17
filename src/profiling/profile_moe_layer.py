@@ -72,6 +72,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outlier-abs-threshold", type=float, default=1e-3)
     parser.add_argument("--jsonl-out", type=Path)
     parser.add_argument("--label", default="")
+    parser.add_argument("--model-shape-name", default="")
+    parser.add_argument("--model-shapes-config", type=Path, default=Path("configs/moe_model_shapes.json"))
+    parser.add_argument("--allow-shape-override", action="store_true")
+    parser.add_argument("--phase-profile", action="store_true")
+    parser.add_argument("--phase-warmup", type=int, default=5)
+    parser.add_argument("--phase-iters", type=int, default=20)
+    parser.add_argument("--skip-memory-preflight", action="store_true")
+    parser.add_argument("--memory-preflight-fraction", type=float, default=0.90)
+    parser.add_argument("--memory-preflight-safety-multiplier", type=float, default=1.35)
     return parser.parse_args()
 
 
@@ -81,6 +90,154 @@ def parse_dtype(name: str) -> torch.dtype:
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }[name]
+
+
+def dtype_nbytes(dtype: torch.dtype) -> int:
+    return {
+        torch.float32: 4,
+        torch.float16: 2,
+        torch.bfloat16: 2,
+    }[dtype]
+
+
+def activation_fn_from_name(name: str):
+    if name == "gelu_tanh":
+        return partial(F.gelu, approximate="tanh")
+    if name == "silu":
+        return F.silu
+    raise RuntimeError(f"Unsupported activation={name!r}.")
+
+
+def load_model_shape(args: argparse.Namespace) -> dict[str, object]:
+    if not args.model_shape_name:
+        return {}
+
+    try:
+        with args.model_shapes_config.open(encoding="utf-8") as handle:
+            shapes = json.load(handle)
+    except OSError as exc:
+        raise RuntimeError(f"Could not read model shape catalog: {args.model_shapes_config}") from exc
+
+    try:
+        shape = shapes[args.model_shape_name]
+    except KeyError as exc:
+        available = ", ".join(sorted(shapes))
+        raise RuntimeError(
+            f"Unknown model shape {args.model_shape_name!r}. Available shapes: {available}",
+        ) from exc
+
+    expected = {
+        "d_model": int(shape["hidden_size"]),
+        "d_ff": int(shape["expert_intermediate_size"]),
+        "n_experts": int(shape["num_routed_experts"]),
+        "top_k": int(shape["num_experts_per_token"]),
+    }
+    mismatches = [
+        f"{key}: arg={getattr(args, key)} catalog={value}"
+        for key, value in expected.items()
+        if getattr(args, key) != value
+    ]
+    max_t = int(shape.get("max_position_embeddings", 0) or 0)
+    if max_t and args.seq_len > max_t:
+        mismatches.append(f"seq_len: arg={args.seq_len} catalog_max={max_t}")
+    if mismatches and not args.allow_shape_override:
+        raise RuntimeError(
+            "Profiler arguments do not match the selected model shape. "
+            "Use --allow-shape-override for axis sweeps. Mismatches: "
+            + "; ".join(mismatches),
+        )
+    return dict(shape)
+
+
+def memory_preflight(
+    args: argparse.Namespace,
+    *,
+    model_shape: dict[str, object],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> dict[str, int | float | bool]:
+    """Estimate memory before allocating synthetic weights/activations.
+
+    This is intentionally conservative and approximate. It is meant to reject
+    obviously-too-large Level 1 shape runs before they trigger CUDA OOM.
+    """
+
+    if args.skip_memory_preflight or device.type != "cuda":
+        return {"memory_preflight_enabled": False}
+
+    if not 0 < args.memory_preflight_fraction <= 1:
+        raise RuntimeError("--memory-preflight-fraction must be in (0, 1].")
+    if args.memory_preflight_safety_multiplier < 1:
+        raise RuntimeError("--memory-preflight-safety-multiplier must be >= 1.")
+
+    nbytes = dtype_nbytes(dtype)
+    tokens = args.batch_size * args.seq_len
+    assignments = tokens * args.top_k
+    expert_type = str(model_shape.get("expert_type", "ffn") or "ffn")
+    weight_mats = 3 if expert_type == "glu" else 2
+    shared_experts = int(model_shape.get("num_shared_experts", 0) or 0)
+    shared_hidden = int(model_shape.get("shared_expert_intermediate_size", 0) or 0)
+
+    routed_param_elems = weight_mats * args.n_experts * args.d_model * args.d_ff
+    shared_param_elems = weight_mats * shared_experts * args.d_model * shared_hidden
+    router_param_elems = args.d_model * args.n_experts
+
+    # Synthetic routing weights currently allocate a Nano-style FFN tensor before
+    # MegaBlocks layer construction. Include it so Level 1 preflight reflects the
+    # current adapter implementation, not only the final MegaBlocks layer.
+    synthetic_adapter_elems = 0
+    if args.weight_source == "synthetic":
+        synthetic_adapter_elems = (
+            2 * args.n_experts * args.d_model * args.d_ff
+            + args.n_experts * (args.d_ff + args.d_model)
+            + router_param_elems
+        )
+
+    input_elems = tokens * args.d_model
+    router_elems = tokens * args.n_experts * 2
+    if args.backend == "reference":
+        dense_rows = tokens * args.n_experts
+        assignment_elems = dense_rows * (args.d_model + args.d_ff + args.d_model)
+        if expert_type == "glu":
+            assignment_elems += dense_rows * args.d_ff
+    else:
+        assignment_elems = assignments * (args.d_model + args.d_ff + args.d_model)
+        if expert_type == "glu":
+            assignment_elems += assignments * args.d_ff
+
+    base_estimated_bytes = int(
+        nbytes
+        * (
+            routed_param_elems
+            + shared_param_elems
+            + router_param_elems
+            + synthetic_adapter_elems
+            + input_elems
+            + router_elems
+            + assignment_elems
+        ),
+    )
+    estimated_bytes = int(base_estimated_bytes * args.memory_preflight_safety_multiplier)
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    allowed_bytes = int(free_bytes * args.memory_preflight_fraction)
+    if estimated_bytes > allowed_bytes:
+        raise RuntimeError(
+            "Memory preflight rejected this run before allocation. "
+            f"estimated={estimated_bytes} base_estimated={base_estimated_bytes} allowed={allowed_bytes} "
+            f"free={free_bytes} total={total_bytes} fraction={args.memory_preflight_fraction}. "
+            "Use a smaller N or --skip-memory-preflight if you intentionally want to test the limit.",
+        )
+
+    return {
+        "memory_preflight_enabled": True,
+        "memory_preflight_estimated_bytes": estimated_bytes,
+        "memory_preflight_base_estimated_bytes": base_estimated_bytes,
+        "memory_preflight_cuda_free_bytes": int(free_bytes),
+        "memory_preflight_cuda_total_bytes": int(total_bytes),
+        "memory_preflight_allowed_bytes": allowed_bytes,
+        "memory_preflight_fraction": float(args.memory_preflight_fraction),
+        "memory_preflight_safety_multiplier": float(args.memory_preflight_safety_multiplier),
+    }
 
 
 def make_synthetic_weights(args: argparse.Namespace, dtype: torch.dtype, device: torch.device) -> NanoMoEWeights:
@@ -103,6 +260,13 @@ def make_synthetic_weights(args: argparse.Namespace, dtype: torch.dtype, device:
         w2=randn(args.n_experts, args.d_ff, args.d_model),
         b2=b2,
     )
+
+
+def make_synthetic_glu_up_weight(args: argparse.Namespace, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(args.seed + 2)
+    v1 = 0.02 * torch.randn(args.n_experts, args.d_model, args.d_ff, generator=generator)
+    return v1.to(device=device, dtype=dtype).contiguous()
 
 
 def zero_expert_biases(weights: NanoMoEWeights) -> NanoMoEWeights:
@@ -203,6 +367,28 @@ def cuda_time_ms(
     end.record()
     torch.cuda.synchronize(device)
     return float(start.elapsed_time(end) / iters)
+
+
+def wall_time_ms(
+    fn,
+    *,
+    warmup: int,
+    iters: int,
+    device: torch.device,
+) -> float:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    for _ in range(warmup):
+        fn()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    start = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return 1000.0 * (time.perf_counter() - start) / iters
 
 
 def measure_forward(
@@ -361,6 +547,27 @@ class NanoMoEBiasedGroupedMLP(torch.nn.Module):
         return x + self.b2.index_select(0, expert_ids)
 
 
+class SyntheticGLUBatchedMLP(torch.nn.Module):
+    """GLU expert MLP for MegaBlocks standard MoE's padded expert layout."""
+
+    def __init__(
+        self,
+        weights: NanoMoEWeights,
+        v1: torch.Tensor,
+        activation_fn: Callable[[torch.Tensor], torch.Tensor],
+    ):
+        super().__init__()
+        self.w_gate = torch.nn.Parameter(weights.w1.contiguous())
+        self.w_up = torch.nn.Parameter(v1.contiguous())
+        self.w_down = torch.nn.Parameter(weights.w2.contiguous())
+        self.activation_fn = activation_fn
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = torch.bmm(x, self.w_gate)
+        up = torch.bmm(x, self.w_up)
+        return torch.bmm(self.activation_fn(gate) * up, self.w_down)
+
+
 @dataclass(frozen=True)
 class MegaBlocksForward:
     output: torch.Tensor
@@ -383,6 +590,7 @@ class MegaBlocksRouting:
 def build_megablocks_layer(
     args: argparse.Namespace,
     weights: NanoMoEWeights,
+    model_shape: dict[str, object],
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.nn.Module:
@@ -405,21 +613,36 @@ def build_megablocks_layer(
     from megablocks.layers.dmoe import dMoE
     from megablocks.layers.moe import MoE
 
+    expert_type = str(model_shape.get("expert_type", "ffn") or "ffn")
+    activation = str(model_shape.get("activation", "gelu_tanh") or "gelu_tanh")
+    shared_experts = int(model_shape.get("num_shared_experts", 0) or 0)
+    shared_hidden = int(model_shape.get("shared_expert_intermediate_size", 0) or 0)
+    if expert_type not in {"ffn", "glu"}:
+        raise RuntimeError(f"Unsupported expert_type={expert_type!r}.")
+    if args.use_expert_biases and expert_type != "ffn":
+        raise RuntimeError("--use-expert-biases is only implemented for Nano FFN adapters.")
+
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
+
     mb_args = Arguments(
         hidden_size=args.d_model,
         ffn_hidden_size=args.d_ff,
         num_layers=1,
         bias=False,
         return_bias=False,
-        activation_fn=partial(F.gelu, approximate="tanh"),
+        activation_fn=activation_fn_from_name(activation),
         moe_num_experts=args.n_experts,
         moe_top_k=args.top_k,
         moe_capacity_factor=0,
         moe_normalize_expert_weights=1,
         moe_loss_weight=0.0,
         memory_optimized_mlp=False,
-        mlp_type="mlp",
+        mlp_type="glu" if expert_type == "glu" else "mlp",
         mlp_impl="grouped",
+        shared_expert=shared_experts > 0,
+        shared_expert_hidden_size=shared_hidden or None,
         fp16=dtype == torch.float16,
         bf16=dtype == torch.bfloat16,
         device=device,
@@ -440,6 +663,27 @@ def build_megablocks_layer(
             else:
                 layer.experts.mlp = NanoMoEBiasedBatchedMLP(weights)
             layer.experts.mlp.eval()
+        elif expert_type == "glu":
+            glu_v1 = make_synthetic_glu_up_weight(args, dtype, device)
+            activation_fn = activation_fn_from_name(activation)
+            if args.megablocks_layer == "moe":
+                # Standard MoE routes into a padded [E, expert_capacity, D]
+                # tensor and expects a batched expert module. MegaBlocks ships
+                # GLU experts for dMoE/grouped dispatch, so this local wrapper
+                # gives Level 1 GLU simulations the same expert math on the
+                # standard padded path.
+                layer.experts.mlp = SyntheticGLUBatchedMLP(weights, glu_v1, activation_fn)
+                layer.experts.mlp.eval()
+            else:
+                layer.experts.mlp.w1.view(args.n_experts, args.d_ff, args.d_model).copy_(
+                    weights.w1.transpose(1, 2).contiguous(),
+                )
+                layer.experts.mlp.v1.view(args.n_experts, args.d_ff, args.d_model).copy_(
+                    glu_v1.transpose(1, 2).contiguous(),
+                )
+                layer.experts.mlp.w2.view(args.n_experts, args.d_ff, args.d_model).copy_(
+                    weights.w2.contiguous(),
+                )
         elif args.megablocks_layer == "dmoe":
             layer.experts.mlp.w1.view(args.n_experts, args.d_ff, args.d_model).copy_(
                 weights.w1.transpose(1, 2).contiguous(),
@@ -459,6 +703,36 @@ def nano_aux_loss_from_router(router_probs: torch.Tensor, top_indices: torch.Ten
     token_fraction = dispatch_mask.mean(dim=0)
     prob_mean = router_probs.mean(dim=0)
     return n_experts * torch.sum(token_fraction * prob_mean)
+
+
+def dense_glu_reference_forward(
+    x: torch.Tensor,
+    weights: NanoMoEWeights,
+    v1: torch.Tensor,
+    *,
+    top_k: int,
+    activation_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Dense all-expert GLU reference for Level 1 synthetic shape runs.
+
+    This is a performance baseline, not an exact OLMoE implementation. It uses
+    the same adapter routing convention as the MegaBlocks Level 1 path.
+    """
+
+    router_logits = torch.matmul(x, weights.router_kernel)
+    top_k_values, top_k_indices = torch.topk(router_logits, top_k, dim=-1)
+    gates = torch.softmax(top_k_values, dim=-1)
+
+    gate_proj = torch.einsum("btd,edh->ebth", x, weights.w1)
+    up_proj = torch.einsum("btd,edh->ebth", x, v1)
+    hidden = activation_fn(gate_proj) * up_proj
+    expert_outputs = torch.einsum("ebth,ehd->ebtd", hidden, weights.w2)
+
+    batch_size, seq_len, _ = x.shape
+    batch_idx = torch.arange(batch_size, device=x.device)[:, None, None]
+    seq_idx = torch.arange(seq_len, device=x.device)[None, :, None]
+    selected = expert_outputs[top_k_indices, batch_idx, seq_idx, :]
+    return torch.sum(gates[..., None] * selected, dim=2)
 
 
 def megablocks_prepare_routing(
@@ -492,6 +766,122 @@ def megablocks_expert_dispatch(layer: torch.nn.Module, routing: MegaBlocksRoutin
         shared_expert_out = layer.shared_expert(routing.x_mb)
         out = layer.shared_expert.add_experts_sharedexpert(shared_expert_out, out)
     return out
+
+
+def promote_scalar_tensor(x: torch.Tensor) -> torch.Tensor:
+    return x.view(1) if not len(x.size()) else x
+
+
+def measure_megablocks_phases(
+    layer: torch.nn.Module,
+    routing: MegaBlocksRouting,
+    args: argparse.Namespace,
+    *,
+    device: torch.device,
+) -> dict[str, float | int | str]:
+    """Replay MegaBlocks expert dispatch in phase-sized pieces.
+
+    These timings are diagnostic. They use the same routed tensors as
+    ``megablocks_core`` timing, but each phase is timed independently, so the
+    numbers should not be treated as an exact additive decomposition.
+    """
+
+    from megablocks import ops
+
+    experts = layer.experts
+    x_flat = routing.x_mb.view(-1, routing.x_mb.shape[-1])
+    top_experts = routing.indices.flatten().int()
+    expert_weights = routing.gates.flatten()
+    top_k = args.top_k
+    phase_warmup = args.phase_warmup
+    phase_iters = args.phase_iters
+
+    if phase_iters < 1:
+        raise RuntimeError("--phase-iters must be >= 1.")
+
+    def time_cuda(fn) -> float:
+        return cuda_time_ms(
+            fn,
+            warmup=phase_warmup,
+            iters=phase_iters,
+            device=device,
+        )
+
+    def sort_phase():
+        return ops.sort(top_experts, experts.sort_end_bit)
+
+    bin_ids, indices = sort_phase()
+    tokens_per_expert = ops.histogram(top_experts, experts.num_experts)
+    bins = promote_scalar_tensor(ops.inclusive_cumsum(tokens_per_expert, 0))
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    metrics: dict[str, float | int | str] = {
+        "phase_profile": True,
+        "phase_profile_warmup": phase_warmup,
+        "phase_profile_iters": phase_iters,
+        "phase_sort_ms": time_cuda(sort_phase),
+        "phase_histogram_ms": time_cuda(
+            lambda: ops.histogram(top_experts, experts.num_experts),
+        ),
+        "phase_cumsum_ms": time_cuda(
+            lambda: promote_scalar_tensor(ops.inclusive_cumsum(tokens_per_expert, 0)),
+        ),
+    }
+
+    if args.megablocks_layer == "moe":
+        expert_capacity = experts.expert_capacity(args.batch_size * args.seq_len)
+        if expert_capacity == 0:
+            expert_capacity = int(torch.max(tokens_per_expert).item())
+        gathered = ops.binned_gather(x_flat, indices, bins, expert_capacity, top_k)
+        expert_out = experts.mlp(gathered)
+
+        metrics.update({
+            "phase_path": "standard_moe_binned",
+            "phase_expert_capacity": int(expert_capacity),
+            "phase_capacity_decision_wall_ms": wall_time_ms(
+                lambda: int(torch.max(tokens_per_expert).item()),
+                warmup=phase_warmup,
+                iters=phase_iters,
+                device=device,
+            ),
+            "phase_gather_ms": time_cuda(
+                lambda: ops.binned_gather(x_flat, indices, bins, expert_capacity, top_k),
+            ),
+            "phase_expert_mlp_ms": time_cuda(lambda: experts.mlp(gathered)),
+            "phase_scatter_ms": time_cuda(
+                lambda: ops.binned_scatter(expert_out, indices, expert_weights, bins, top_k),
+            ),
+        })
+    elif args.megablocks_layer == "dmoe":
+        gathered = ops.gather(x_flat, indices, bin_ids, bins, top_k)
+        expert_out = experts.mlp(gathered, tokens_per_expert)
+
+        metrics.update({
+            "phase_path": "dmoe_grouped",
+            "phase_expert_capacity": 0,
+            "phase_capacity_decision_wall_ms": 0.0,
+            "phase_gather_ms": time_cuda(
+                lambda: ops.gather(x_flat, indices, bin_ids, bins, top_k),
+            ),
+            "phase_expert_mlp_ms": time_cuda(lambda: experts.mlp(gathered, tokens_per_expert)),
+            "phase_scatter_ms": time_cuda(
+                lambda: ops.scatter(expert_out, indices, bin_ids, expert_weights, bins, top_k),
+            ),
+        })
+    else:
+        raise RuntimeError(f"Unsupported MegaBlocks layer for phase profiling: {args.megablocks_layer}")
+
+    gpu_phase_keys = (
+        "phase_sort_ms",
+        "phase_histogram_ms",
+        "phase_cumsum_ms",
+        "phase_gather_ms",
+        "phase_expert_mlp_ms",
+        "phase_scatter_ms",
+    )
+    metrics["phase_gpu_sum_ms"] = float(sum(float(metrics[key]) for key in gpu_phase_keys))
+    return metrics
 
 
 def megablocks_forward(
@@ -706,41 +1096,78 @@ def tokens_per_expert_metrics(tokens_per_expert: Optional[torch.Tensor]) -> dict
     if tokens_per_expert is None:
         return {}
     counts = tokens_per_expert.detach().float().cpu()
+    mean = float(counts.mean().item())
     return {
         "tokens_per_expert_min": int(counts.min().item()),
         "tokens_per_expert_max": int(counts.max().item()),
-        "tokens_per_expert_mean": float(counts.mean().item()),
+        "tokens_per_expert_mean": mean,
         "tokens_per_expert_std": float(counts.std(unbiased=False).item()),
+        "expert_imbalance": float(counts.max().item() / mean) if mean else 0.0,
     }
+
+
+def expert_flop_multiplier(expert_type: str) -> int:
+    if expert_type == "ffn":
+        return 4
+    if expert_type == "glu":
+        return 6
+    raise ValueError(f"Unsupported expert_type={expert_type!r}; expected 'ffn' or 'glu'.")
 
 
 def flops_metrics(
     args: argparse.Namespace,
     *,
+    model_shape: dict[str, object],
     tokens_per_expert: Optional[torch.Tensor],
     mean_forward_ms: float,
 ) -> dict[str, float | int]:
     tokens = args.batch_size * args.seq_len
+    assignments = tokens * args.top_k
+    expert_type = str(model_shape.get("expert_type", "ffn") or "ffn")
+    multiplier = expert_flop_multiplier(expert_type)
+    shared_experts = int(model_shape.get("num_shared_experts", 0) or 0)
+    shared_hidden = int(model_shape.get("shared_expert_intermediate_size", 0) or 0)
     router_flops = 2 * tokens * args.d_model * args.n_experts
-    active_expert_flops = 4 * tokens * args.top_k * args.d_model * args.d_ff
+    routed_active_per_token = multiplier * args.top_k * args.d_model * args.d_ff
+    shared_per_token = multiplier * shared_experts * args.d_model * shared_hidden
+    active_expert_flops_per_token = routed_active_per_token + shared_per_token
+    dense_all_expert_flops_per_token = (
+        multiplier * args.n_experts * args.d_model * args.d_ff + shared_per_token
+    )
+    active_expert_flops = tokens * active_expert_flops_per_token
 
-    padded_expert_rows = 0
+    backend_expert_rows = assignments
     if args.backend == "reference":
-        backend_expert_flops = 4 * tokens * args.n_experts * args.d_model * args.d_ff
+        backend_expert_rows = tokens * args.n_experts
+        backend_expert_flops = tokens * dense_all_expert_flops_per_token
     elif args.megablocks_layer == "moe" and tokens_per_expert is not None:
-        padded_expert_rows = int(args.n_experts * tokens_per_expert.max().item())
-        backend_expert_flops = 4 * padded_expert_rows * args.d_model * args.d_ff
+        backend_expert_rows = int(args.n_experts * tokens_per_expert.max().item())
+        backend_expert_flops = (
+            multiplier * backend_expert_rows * args.d_model * args.d_ff
+            + tokens * shared_per_token
+        )
     else:
         backend_expert_flops = active_expert_flops
 
     backend_total_flops = router_flops + backend_expert_flops
     seconds = mean_forward_ms / 1000.0
+    padding_factor = float(backend_expert_rows / assignments) if assignments else 0.0
     return {
+        "assignments": int(assignments),
         "router_flops": int(router_flops),
         "active_expert_flops": int(active_expert_flops),
         "backend_expert_flops_estimate": int(backend_expert_flops),
         "backend_total_flops_estimate": int(backend_total_flops),
-        "megablocks_padded_expert_rows": padded_expert_rows,
+        "megablocks_padded_expert_rows": int(backend_expert_rows if args.megablocks_layer == "moe" else 0),
+        "backend_expert_rows": int(backend_expert_rows),
+        "padding_factor": padding_factor,
+        "routed_active_expert_flops_per_token": int(routed_active_per_token),
+        "shared_expert_flops_per_token": int(shared_per_token),
+        "active_expert_flops_per_token": int(active_expert_flops_per_token),
+        "dense_all_expert_flops_per_token": int(dense_all_expert_flops_per_token),
+        "backend_expert_flops_per_token": float(backend_expert_flops / tokens) if tokens else 0.0,
+        "ms_per_input_token": float(mean_forward_ms / tokens) if tokens else 0.0,
+        "ms_per_assignment": float(mean_forward_ms / assignments) if assignments else 0.0,
         "tokens_per_second": float(tokens / seconds),
         "active_expert_tflops_per_second": float(active_expert_flops / seconds / 1e12),
         "backend_estimated_tflops_per_second": float(backend_total_flops / seconds / 1e12),
@@ -774,27 +1201,54 @@ def main() -> None:
     if args.trials < 1:
         raise SystemExit("--trials must be >= 1.")
 
+    model_shape = load_model_shape(args)
     device = torch.device(args.device)
     dtype = parse_dtype(args.dtype)
     timing_scope = resolve_timing_scope(args)
     if timing_scope == "megablocks_core" and args.backend != "megablocks":
         raise SystemExit("--timing-scope megablocks_core is only valid with --backend megablocks.")
+    if args.phase_profile and args.backend != "megablocks":
+        raise SystemExit("--phase-profile is only valid with --backend megablocks.")
+    preflight_metrics = memory_preflight(
+        args,
+        model_shape=model_shape,
+        dtype=dtype,
+        device=device,
+    )
     weights = make_weights(args, dtype, device)
     x = make_input(args, dtype, device)
     check_metrics = {}
+    phase_metrics = {}
     tokens_per_expert = None
+    expert_type = str(model_shape.get("expert_type", "ffn") or "ffn")
+    activation = str(model_shape.get("activation", "gelu_tanh") or "gelu_tanh")
 
     if args.backend == "reference":
-        def run():
-            return nano_moe_forward(
-                x,
-                weights,
-                top_k=args.top_k,
-                deterministic=True,
-                dropout_p=0.0,
-            ).output
+        if expert_type == "glu":
+            if args.weight_source != "synthetic":
+                raise RuntimeError("Dense GLU reference is only supported with --weight-source synthetic.")
+            glu_v1 = make_synthetic_glu_up_weight(args, dtype, device)
+            activation_fn = activation_fn_from_name(activation)
+
+            def run():
+                return dense_glu_reference_forward(
+                    x,
+                    weights,
+                    glu_v1,
+                    top_k=args.top_k,
+                    activation_fn=activation_fn,
+                )
+        else:
+            def run():
+                return nano_moe_forward(
+                    x,
+                    weights,
+                    top_k=args.top_k,
+                    deterministic=True,
+                    dropout_p=0.0,
+                ).output
     else:
-        layer = build_megablocks_layer(args, weights, dtype, device)
+        layer = build_megablocks_layer(args, weights, model_shape, dtype, device)
         if timing_scope == "megablocks_core":
             timed_routing = megablocks_prepare_routing(
                 layer,
@@ -826,6 +1280,21 @@ def main() -> None:
         )
 
     if args.backend == "megablocks":
+        if args.phase_profile:
+            with torch.inference_mode():
+                phase_routing = megablocks_prepare_routing(
+                    layer,
+                    x,
+                    n_experts=args.n_experts,
+                    top_k=args.top_k,
+                )
+                phase_metrics = measure_megablocks_phases(
+                    layer,
+                    phase_routing,
+                    args,
+                    device=device,
+                )
+
         with torch.inference_mode():
             mb_forward = megablocks_forward(
                 layer,
@@ -857,15 +1326,23 @@ def main() -> None:
     tokens = args.batch_size * args.seq_len
     flops = flops_metrics(
         args,
+        model_shape=model_shape,
         tokens_per_expert=tokens_per_expert,
         mean_forward_ms=timing_metrics["mean_forward_ms"],
     )
     expert_count_metrics = tokens_per_expert_metrics(tokens_per_expert)
+    model_shape_name = args.model_shape_name or "custom"
+    simulation_level = str(model_shape.get("simulation_level", "custom"))
+    shared_experts = int(model_shape.get("num_shared_experts", 0) or 0)
+    shared_hidden = int(model_shape.get("shared_expert_intermediate_size", 0) or 0)
+    max_position_embeddings = model_shape.get("max_position_embeddings")
     record = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "label": args.label,
+        "model_shape_name": model_shape_name,
+        "simulation_level": simulation_level,
         "backend_variant": (
-            f"megablocks_{args.megablocks_layer}" if args.backend == "megablocks" else "reference"
+            f"megablocks_{args.megablocks_layer}" if args.backend == "megablocks" else f"reference_dense_{expert_type}"
         ),
         "backend": args.backend,
         "megablocks_layer": args.megablocks_layer if args.backend == "megablocks" else None,
@@ -878,6 +1355,11 @@ def main() -> None:
         "d_ff": args.d_ff,
         "n_experts": args.n_experts,
         "top_k": args.top_k,
+        "num_shared_experts": shared_experts,
+        "shared_expert_intermediate_size": shared_hidden,
+        "expert_type": expert_type,
+        "activation": activation,
+        "max_position_embeddings": max_position_embeddings,
         "warmup": args.warmup,
         "iters": args.iters,
         "trials": args.trials,
@@ -892,9 +1374,11 @@ def main() -> None:
         "verbose_checks": args.verbose_checks,
         "torch": torch.__version__,
         **gpu_metadata(device),
+        **preflight_metrics,
         **timing_metrics,
         **expert_count_metrics,
         **flops,
+        **phase_metrics,
         **check_metrics,
     }
 
@@ -907,8 +1391,16 @@ def main() -> None:
     print(f"experts: n={args.n_experts} top_k={args.top_k} d_ff={args.d_ff}")
     print(f"timing_scope: {timing_scope}")
     print(f"mean_forward_ms: {timing_metrics['mean_forward_ms']:.4f}")
+    print(f"ms_per_input_token: {flops['ms_per_input_token']:.8f}")
+    print(f"active_expert_tflops_per_second: {flops['active_expert_tflops_per_second']:.4f}")
     print(f"std_forward_ms: {timing_metrics['std_forward_ms']:.4f}")
     print(f"peak_memory_allocated_bytes: {timing_metrics['peak_memory_allocated_bytes']}")
+    if phase_metrics:
+        print(f"phase_path: {phase_metrics['phase_path']}")
+        print(f"phase_gpu_sum_ms: {phase_metrics['phase_gpu_sum_ms']:.4f}")
+        print(f"phase_gather_ms: {phase_metrics['phase_gather_ms']:.4f}")
+        print(f"phase_expert_mlp_ms: {phase_metrics['phase_expert_mlp_ms']:.4f}")
+        print(f"phase_scatter_ms: {phase_metrics['phase_scatter_ms']:.4f}")
     if args.jsonl_out is not None:
         args.jsonl_out.parent.mkdir(parents=True, exist_ok=True)
         with args.jsonl_out.open("a", encoding="utf-8") as handle:

@@ -28,26 +28,11 @@ described in the setup docs.
 
 ## Current Status
 
-The PyTorch NanoMoE reference matches Nano-MoE-JAX for output, router gates, expert
-indices, and auxiliary loss. `grouped_gemm` and `megablocks_ops` build successfully
-using the local CUDA 12.6 overlay on the RTX 3080 host.
+The current docs are split by purpose:
 
-Current validated MegaBlocks correctness smoke uses Nano-JAX initialized weights,
-the full `(B, T, D)` adapter boundary, Nano-style aux loss, and paired reference
-rows:
-
-- `megablocks/moe`, float32 and float16: exact agreement with the PyTorch Nano
-  reference on the smoke shape.
-- `megablocks/dmoe`, bfloat16, zero expert biases: exact agreement with the
-  PyTorch Nano reference on the smoke shape.
-- `megablocks/dmoe`, bfloat16, synthetic nonzero expert biases: exact agreement
-  with the PyTorch Nano reference through the bias-aware grouped adapter.
-
-Still under investigation:
-
-- FP16/FP32 grouped `dmoe`; the current grouped GEMM extension requires BF16.
-- Broader plotted sweeps over larger shapes and checkpoint-like activation/weight
-  distributions.
+- `docs/moe_megablocks_deep_dive.md`: MegaBlocks `moe`/`dmoe` implementation.
+- `docs/metrics_and_results.md`: metrics, plots, result interpretation.
+- `docs/next_steps.md`: completed work and next actions.
 
 Start with:
 
@@ -59,7 +44,10 @@ python src/profiling/verify_moe_layer.py
 
 See:
 
-- `Findings.md`
+- `docs/moe_megablocks_deep_dive.md`
+- `docs/metrics_and_results.md`
+- `docs/next_steps.md`
+- `configs/moe_model_shapes.json`
 - `docs/setup.md`
 - `docs/usage.md`
 - `docs/architecture.md`
