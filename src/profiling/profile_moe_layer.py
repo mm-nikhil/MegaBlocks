@@ -62,8 +62,14 @@ def parse_args() -> argparse.Namespace:
             "and the full reference boundary for the reference backend."
         ),
     )
-    parser.add_argument("--weight-source", choices=("nano_jax_init", "synthetic"), default="nano_jax_init")
+    parser.add_argument(
+        "--weight-source",
+        choices=("nano_jax_init", "synthetic", "trained_nano_checkpoint"),
+        default="nano_jax_init",
+    )
     parser.add_argument("--nano-jax-dir", type=Path, default=Path("third_party/Nano-MoE-JAX"))
+    parser.add_argument("--checkpoint-dir", type=Path, default=Path("results/trained_nano_moe_checkpoint"))
+    parser.add_argument("--checkpoint-block-index", type=int, default=0)
     parser.add_argument("--zero-expert-biases", action="store_true")
     parser.add_argument("--use-expert-biases", action="store_true")
     parser.add_argument("--allow-bias-mismatch", action="store_true")
@@ -317,9 +323,82 @@ def make_nano_jax_initialized_weights(
     return from_flax_moe_params(params, device=device, dtype=dtype)
 
 
+def make_trained_nano_checkpoint_weights(
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> NanoMoEWeights:
+    checkpoint_dir = args.checkpoint_dir.resolve()
+    metadata_path = checkpoint_dir / "metadata.json"
+    params_path = checkpoint_dir / "params.msgpack"
+    if not metadata_path.exists() or not params_path.exists():
+        raise RuntimeError(
+            f"Trained Nano checkpoint not found in {checkpoint_dir}. "
+            "Expected metadata.json and params.msgpack.",
+        )
+
+    nano_dir = args.nano_jax_dir.resolve()
+    if not nano_dir.exists():
+        raise RuntimeError(f"Nano-MoE-JAX checkout not found: {nano_dir}")
+
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    sys.path.insert(0, str(nano_dir))
+    try:
+        import jax
+        import jax.numpy as jnp
+        from flax import serialization
+        from nano_moe.config import NanoMoEConfig
+        from nano_moe.model import NanoMoE
+    except ImportError as exc:
+        raise RuntimeError(
+            "weight_source=trained_nano_checkpoint requires JAX, Flax, and the "
+            "Nano-MoE-JAX checkout."
+        ) from exc
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    config_data = metadata["config"]
+    fields = NanoMoEConfig.__dataclass_fields__
+    config = NanoMoEConfig(**{key: config_data[key] for key in fields if key in config_data})
+
+    if args.checkpoint_block_index < 0 or args.checkpoint_block_index >= config.n_layers:
+        raise RuntimeError(
+            f"--checkpoint-block-index must be in [0, {config.n_layers}) for this checkpoint.",
+        )
+
+    mismatches = []
+    expected = {
+        "d_model": config.d_model,
+        "d_ff": config.d_ff,
+        "n_experts": config.n_experts,
+        "top_k": config.top_k,
+    }
+    for key, expected_value in expected.items():
+        actual_value = getattr(args, key)
+        if actual_value != expected_value:
+            mismatches.append(f"{key}: arg={actual_value} checkpoint={expected_value}")
+    if mismatches:
+        raise RuntimeError(
+            "Profiler arguments do not match the trained Nano checkpoint MoE shape: "
+            + "; ".join(mismatches),
+        )
+
+    dummy = jnp.ones((1, config.block_size), dtype=jnp.int32)
+    rng = jax.random.PRNGKey(0)
+    template = NanoMoE(config=config).init(
+        {"params": rng, "dropout": rng},
+        dummy,
+        deterministic=True,
+    )["params"]
+    params = serialization.from_bytes(template, params_path.read_bytes())
+    moe_params = params[f"block_{args.checkpoint_block_index}"]["MoELayer_0"]
+    return from_flax_moe_params(moe_params, device=device, dtype=dtype)
+
+
 def make_weights(args: argparse.Namespace, dtype: torch.dtype, device: torch.device) -> NanoMoEWeights:
     if args.weight_source == "nano_jax_init":
         weights = make_nano_jax_initialized_weights(args, dtype, device)
+    elif args.weight_source == "trained_nano_checkpoint":
+        weights = make_trained_nano_checkpoint_weights(args, dtype, device)
     else:
         weights = make_synthetic_weights(args, dtype, device)
 
@@ -1365,6 +1444,10 @@ def main() -> None:
         "trials": args.trials,
         "timing_scope": timing_scope,
         "weight_source": args.weight_source,
+        "checkpoint_dir": str(args.checkpoint_dir) if args.weight_source == "trained_nano_checkpoint" else None,
+        "checkpoint_block_index": (
+            args.checkpoint_block_index if args.weight_source == "trained_nano_checkpoint" else None
+        ),
         "zero_expert_biases": args.zero_expert_biases,
         "use_expert_biases": args.use_expert_biases,
         "allow_bias_mismatch": args.allow_bias_mismatch,

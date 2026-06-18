@@ -144,7 +144,13 @@ def run_case(case_args: Namespace) -> dict[str, object]:
     dtype = parse_dtype(case_args.dtype)
     weights = make_weights(case_args, dtype, device)
     x = make_input(case_args, dtype, device)
-    layer = build_megablocks_layer(case_args, weights, dtype, device)
+    model_shape = {
+        "expert_type": "ffn",
+        "activation": "gelu_tanh",
+        "num_shared_experts": 0,
+        "shared_expert_intermediate_size": 0,
+    }
+    layer = build_megablocks_layer(case_args, weights, model_shape, dtype, device)
 
     with torch.inference_mode():
         actual = megablocks_forward(

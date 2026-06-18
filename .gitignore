@@ -1,6 +1,7 @@
 .venv/
 .cuda/
 workspace/
+data/
 __pycache__/
 *.py[cod]
 *.egg-info/

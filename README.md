@@ -31,6 +31,7 @@ described in the setup docs.
 The current docs are split by purpose:
 
 - `docs/moe_megablocks_deep_dive.md`: MegaBlocks `moe`/`dmoe` implementation.
+- `docs/verification.md`: NanoJAX, PyTorch reference, MegaBlocks, and trained-weight verification.
 - `docs/metrics_and_results.md`: metrics, plots, result interpretation.
 - `docs/next_steps.md`: completed work and next actions.
 

@@ -302,6 +302,22 @@ MegaBlocks implementation finding and is explained in
 Grouped `megablocks_dmoe` avoids that standard-moe binned grid limit in the
 current runs.
 
+Trained NanoJAX checkpoints need special interpretation because trained Nano
+experts have nonzero Dense biases:
+
+```text
+Nano trained expert: hidden = gelu(x @ W1 + b1), out = hidden @ W2 + b2
+Stock MegaBlocks FFN: hidden = gelu(x @ W1), out = hidden @ W2
+```
+
+The correctness-preserving trained run uses a local bias adapter so MegaBlocks
+routes to the same experts and computes the same expert function, within dtype
+precision. That adapter is not pure stock MegaBlocks expert compute. In grouped
+dMoE it adds per-routed-row bias indexing and elementwise additions, so its
+large-N performance can be lower than the no-bias control. The no-bias trained
+run is useful only as a performance control for the stock bias-free path; it is
+not mathematically equivalent to trained NanoJAX when expert biases are nonzero.
+
 ### OLMoE-1B-7B-0924 Shape
 
 Current backend variants:

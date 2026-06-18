@@ -2,6 +2,14 @@
 
 model_shape_name: `nano_moe_jax`
 simulation_level: `exact_adapter`
+weight_source: `trained_nano_checkpoint`
+dtype: `bfloat16`
+
+checkpoint_dir: `results/trained_nano_moe_checkpoint`
+checkpoint_block_index: `0`
+
+check_output: `True`
+outlier_abs_threshold: `0.02`
 
 Max successful `N` by backend:
 

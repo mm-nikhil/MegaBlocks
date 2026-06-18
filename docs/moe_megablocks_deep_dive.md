@@ -161,6 +161,37 @@ Dense biases and MegaBlocks stock experts are bias-free. The current
 OLMoE-shaped benchmark uses synthetic GLU weights and no exact
 checkpoint/router semantics.
 
+For Nano FFN experts, the trained NanoJAX expert math is:
+
+```text
+hidden = gelu(x @ W1 + b1)
+out = hidden @ W2 + b2
+```
+
+Stock MegaBlocks FFN expert math is:
+
+```text
+hidden = gelu(x @ W1)
+out = hidden @ W2
+```
+
+So trained Nano weights with nonzero `b1`/`b2` cannot be copied into stock
+MegaBlocks FFN experts and still be mathematically equivalent. The router can
+select the same experts and the main matmuls can use the same `W1`/`W2`, but the
+expert function is missing terms unless the biases are modeled.
+
+Our trained Nano bias adapter preserves correctness by adding those per-expert
+biases around the MegaBlocks dispatch/expert/combine path. For standard `moe`,
+this means adding `b1` and `b2` in the padded expert-major layout. For grouped
+`dmoe`, this means recovering the expert id for each routed row and adding
+`b1[expert_id]` and `b2[expert_id]` after the grouped GEMMs.
+
+This makes the trained-with-bias run correctness-equivalent to NanoJAX, but it
+is not pure stock MegaBlocks expert compute. The no-bias trained run is only a
+performance control: it measures the stock bias-free path with trained `W1`/`W2`
+and routing, but it is not equivalent to trained NanoJAX when expert biases are
+nonzero.
+
 ## Source Findings
 
 This section is the source-backed answer to "what does MegaBlocks do,
@@ -740,6 +771,7 @@ Standard `moe`:
 Sparse activation, padded expert batches.
 Useful for comparing padded sparse dispatch against dense references.
 In this checkout, stock standard expert MLP is two-matmul MLP.
+Stock expert MLP is bias-free; trained Nano exactness needs a local bias adapter.
 Our OLMoE-shaped standard-moe line uses a local GLU wrapper for GLU semantics.
 Observed high-N failure when expert_capacity exceeded 65535 on binned_gather.
 ```
@@ -751,6 +783,8 @@ Sparse activation, no padding to busiest expert in the grouped path.
 Uses grouped_gemm/CUTLASS with tokens_per_expert as batch sizes.
 Avoids the standard-moe binned grid limit observed at Nano N=131072.
 Requires BF16 in this local grouped_gemm extension.
+Trained Nano exactness with nonzero expert biases needs per-routed-row bias adds,
+which are extra adapter work outside the stock grouped GEMM path.
 ```
 
 What not to claim:

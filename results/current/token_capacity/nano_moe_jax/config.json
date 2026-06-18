@@ -4,6 +4,8 @@
     "megablocks_moe",
     "megablocks_dmoe"
   ],
+  "checkpoint_block_index": 0,
+  "checkpoint_dir": "results/trained_nano_moe_checkpoint",
   "device": "cuda",
   "dtype": "bfloat16",
   "iters": 20,
@@ -11,6 +13,7 @@
   "memory_preflight_safety_multiplier": 1.35,
   "model_shape_name": "nano_moe_jax",
   "model_shapes_config": "configs/moe_model_shapes.json",
+  "outlier_abs_threshold": 0.02,
   "phase_iters": 20,
   "phase_profile": false,
   "phase_warmup": 5,
@@ -34,7 +37,7 @@
     "source": "third_party/Nano-MoE-JAX/nano_moe/config.py",
     "source_verified_on": "2026-06-17"
   },
-  "skip_check_output": true,
+  "skip_check_output": false,
   "skip_memory_preflight": false,
   "timing_scope": "auto",
   "tokens": [
@@ -51,5 +54,5 @@
   ],
   "trials": 2,
   "warmup": 5,
-  "weight_source": "nano_jax_init"
+  "weight_source": "trained_nano_checkpoint"
 }

@@ -25,6 +25,9 @@ SUMMARY_FIELDS = (
     "simulation_level",
     "backend_variant",
     "timing_scope",
+    "weight_source",
+    "checkpoint_dir",
+    "checkpoint_block_index",
     "device",
     "dtype",
     "batch_size",
@@ -38,6 +41,8 @@ SUMMARY_FIELDS = (
     "shared_expert_intermediate_size",
     "expert_type",
     "activation",
+    "bias_semantics",
+    "expert_bias_max_abs",
     "mean_forward_ms",
     "std_forward_ms",
     "memory_preflight_enabled",
@@ -75,8 +80,14 @@ SUMMARY_FIELDS = (
     "tokens_per_expert_std",
     "expert_imbalance",
     "check_output",
+    "correctness_passed",
+    "outlier_abs_threshold",
     "max_abs_vs_reference",
+    "mean_abs_vs_reference",
+    "max_rel_vs_reference",
+    "aux_loss_abs_diff",
     "router_expert_set_mismatch_count",
+    "router_gate_max_abs",
     "outlier_diagnosis",
     "label",
 )
@@ -105,8 +116,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--timing-scope", choices=("auto", "megablocks_core", "adapter_boundary"), default="auto")
-    parser.add_argument("--weight-source", choices=("auto", "nano_jax_init", "synthetic"), default="auto")
+    parser.add_argument(
+        "--weight-source",
+        choices=("auto", "nano_jax_init", "synthetic", "trained_nano_checkpoint"),
+        default="auto",
+    )
     parser.add_argument("--nano-jax-dir", type=Path, default=Path("third_party/Nano-MoE-JAX"))
+    parser.add_argument("--checkpoint-dir", type=Path, default=Path("results/trained_nano_moe_checkpoint"))
+    parser.add_argument("--checkpoint-block-index", type=int, default=0)
     parser.add_argument("--outlier-abs-threshold", type=float, default=1e-3)
     parser.add_argument("--append", action="store_true")
     parser.add_argument("--skip-check-output", action="store_true")
@@ -254,7 +271,8 @@ def save_dashboard(rows: list[dict], shape: dict, out_path: Path) -> None:
         f"E={shape['num_routed_experts']} K={shape['num_experts_per_token']} "
         f"S={shape.get('num_shared_experts', 0)} "
         f"{shape['expert_type']}/{shape['activation']} "
-        f"dtype={rows[0].get('dtype')}\n"
+        f"dtype={rows[0].get('dtype')} "
+        f"weights={rows[0].get('weight_source', 'unknown')}\n"
         f"timing: {timing_text}"
     )
     caveat = simulation_caveat(rows[0].get("simulation_level"))
@@ -341,8 +359,21 @@ def write_notes(
         "",
         f"model_shape_name: `{args.model_shape_name}`",
         f"simulation_level: `{shape.get('simulation_level')}`",
+        f"weight_source: `{args.weight_source}`",
+        f"dtype: `{args.dtype or shape['dtype']}`",
         "",
     ]
+    if args.weight_source == "trained_nano_checkpoint":
+        lines.extend([
+            f"checkpoint_dir: `{args.checkpoint_dir}`",
+            f"checkpoint_block_index: `{args.checkpoint_block_index}`",
+            "",
+        ])
+    lines.extend([
+        f"check_output: `{not args.skip_check_output and shape.get('simulation_level') == 'exact_adapter'}`",
+        f"outlier_abs_threshold: `{args.outlier_abs_threshold}`",
+        "",
+    ])
     caveat = simulation_caveat(shape.get("simulation_level"))
     if caveat:
         lines.extend([
@@ -476,6 +507,9 @@ def main() -> None:
         "trials": args.trials,
         "timing_scope": args.timing_scope,
         "weight_source": weight_source,
+        "checkpoint_dir": str(args.checkpoint_dir) if weight_source == "trained_nano_checkpoint" else None,
+        "checkpoint_block_index": args.checkpoint_block_index if weight_source == "trained_nano_checkpoint" else None,
+        "outlier_abs_threshold": args.outlier_abs_threshold,
         "skip_check_output": args.skip_check_output,
         "phase_profile": args.phase_profile,
         "plot_mode": args.plot_mode,
@@ -560,6 +594,10 @@ def main() -> None:
                 weight_source,
                 "--nano-jax-dir",
                 str(args.nano_jax_dir),
+                "--checkpoint-dir",
+                str(args.checkpoint_dir),
+                "--checkpoint-block-index",
+                str(args.checkpoint_block_index),
                 "--outlier-abs-threshold",
                 str(args.outlier_abs_threshold),
                 "--jsonl-out",
