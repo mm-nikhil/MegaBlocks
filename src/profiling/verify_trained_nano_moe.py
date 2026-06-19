@@ -433,7 +433,7 @@ def verify_params(
         ref_ms = float(reference_timing["mean_forward_ms"])
         mb_ms = float(megablocks_timing["mean_forward_ms"])
         timing_metrics = {
-            "timing_scope": "adapter_boundary",
+            "timing_scope": "moe_layer",
             "timing_warmup": args.timing_warmup,
             "timing_iters": args.timing_iters,
             "timing_trials": args.timing_trials,

@@ -96,8 +96,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--timing-scope",
-        choices=("auto", "megablocks_core", "adapter_boundary"),
+        choices=("auto", "expert_path", "moe_layer"),
         default="auto",
+        help=(
+            "auto uses expert_path for MegaBlocks and moe_layer for reference. "
+            "moe_layer is the full MoE layer; expert_path isolates the prepared "
+            "MegaBlocks expert path."
+        ),
     )
     parser.add_argument("--weight-source", choices=("nano_jax_init", "synthetic"), default="nano_jax_init")
     parser.add_argument("--nano-jax-dir", type=Path, default=Path("third_party/Nano-MoE-JAX"))

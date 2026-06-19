@@ -1,5 +1,6 @@
 .venv/
 .cuda/
+.tools/
 workspace/
 data/
 __pycache__/

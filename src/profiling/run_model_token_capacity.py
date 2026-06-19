@@ -17,6 +17,9 @@ from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import Iterable
 
+from moe_profile.run_fields import MOE_OP_FIELDS
+from moe_profile.run_plots import save_moe_op_dashboard
+
 
 DEFAULT_TOKENS = "512,1024,2048,4096,8192,16384,32768,65536,131072"
 DEFAULT_BACKENDS = "reference,megablocks_moe,megablocks_dmoe"
@@ -74,6 +77,7 @@ SUMMARY_FIELDS = (
     "phase_scatter_ms",
     "phase_gpu_sum_ms",
     "phase_expert_capacity",
+    *MOE_OP_FIELDS,
     "tokens_per_expert_min",
     "tokens_per_expert_max",
     "tokens_per_expert_mean",
@@ -115,7 +119,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--timing-scope", choices=("auto", "megablocks_core", "adapter_boundary"), default="auto")
+    parser.add_argument(
+        "--timing-scope",
+        choices=("auto", "expert_path", "moe_layer"),
+        default="auto",
+        help=(
+            "auto uses expert_path for MegaBlocks and moe_layer for reference. "
+            "moe_layer is the full MoE layer; expert_path is the prepared "
+            "MegaBlocks dispatch/expert/combine path."
+        ),
+    )
     parser.add_argument(
         "--weight-source",
         choices=("auto", "nano_jax_init", "synthetic", "trained_nano_checkpoint"),
@@ -130,6 +143,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase-profile", action="store_true")
     parser.add_argument("--phase-warmup", type=int, default=5)
     parser.add_argument("--phase-iters", type=int, default=20)
+    parser.add_argument(
+        "--moe-op-profile",
+        action="store_true",
+        help="Collect logical MoE-layer op timings and write graphs_moe_ops.png.",
+    )
+    parser.add_argument("--moe-op-warmup", type=int, default=5)
+    parser.add_argument("--moe-op-iters", type=int, default=20)
     parser.add_argument("--plot-mode", choices=("token_capacity", "phase_profile"), default="token_capacity")
     parser.add_argument("--skip-memory-preflight", action="store_true")
     parser.add_argument("--memory-preflight-fraction", type=float, default=0.90)
@@ -486,7 +506,10 @@ def main() -> None:
     raw_path = result_dir / "raw.jsonl"
     summary_path = result_dir / "summary.csv"
     dashboard_path = result_dir / "dashboard.png"
+    token_capacity_dashboard_path = result_dir / "graphs_token_capacity.png"
+    phase_specific_dashboard_path = result_dir / "graphs_phase_profile.png"
     phase_dashboard_path = result_dir / "phase_dashboard.png"
+    moe_op_dashboard_path = result_dir / "graphs_moe_ops.png"
     config_path = result_dir / "config.json"
     notes_path = result_dir / "notes.md"
     backend_status_path = result_dir / "backend_status.md"
@@ -512,9 +535,12 @@ def main() -> None:
         "outlier_abs_threshold": args.outlier_abs_threshold,
         "skip_check_output": args.skip_check_output,
         "phase_profile": args.phase_profile,
+        "moe_op_profile": args.moe_op_profile,
         "plot_mode": args.plot_mode,
         "phase_warmup": args.phase_warmup,
         "phase_iters": args.phase_iters,
+        "moe_op_warmup": args.moe_op_warmup,
+        "moe_op_iters": args.moe_op_iters,
         "skip_memory_preflight": args.skip_memory_preflight,
         "memory_preflight_fraction": args.memory_preflight_fraction,
         "memory_preflight_safety_multiplier": args.memory_preflight_safety_multiplier,
@@ -613,6 +639,14 @@ def main() -> None:
                     "--phase-iters",
                     str(args.phase_iters),
                 ])
+            if args.moe_op_profile and backend != "reference":
+                cmd.extend([
+                    "--moe-op-profile",
+                    "--moe-op-warmup",
+                    str(args.moe_op_warmup),
+                    "--moe-op-iters",
+                    str(args.moe_op_iters),
+                ])
             if args.skip_memory_preflight:
                 cmd.append("--skip-memory-preflight")
             cmd.extend([
@@ -655,16 +689,28 @@ def main() -> None:
         write_summary_csv(rows, summary_path)
         if args.plot_mode == "phase_profile":
             save_phase_dashboard(rows, dashboard_path)
+            save_phase_dashboard(rows, phase_specific_dashboard_path)
             if phase_dashboard_path.exists():
                 phase_dashboard_path.unlink()
         else:
             save_dashboard(rows, shape, dashboard_path)
+            save_dashboard(rows, shape, token_capacity_dashboard_path)
             if phase_dashboard_path.exists():
                 phase_dashboard_path.unlink()
+        if args.moe_op_profile:
+            save_moe_op_dashboard(
+                rows,
+                moe_op_dashboard_path,
+                x_key="tokens",
+                series_key="backend_variant",
+                title="MoE Layer Operation Profile",
+            )
         write_notes(path=notes_path, args=args, shape=shape, rows=rows, failures=failures)
         write_backend_status(backend_status_path, rows, failures, backends)
         print(f"summary_csv={summary_path}")
         print(f"dashboard={dashboard_path}")
+        if args.moe_op_profile:
+            print(f"moe_op_dashboard={moe_op_dashboard_path}")
         print(f"notes={notes_path}")
         print(f"backend_status={backend_status_path}")
 

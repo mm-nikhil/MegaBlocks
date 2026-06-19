@@ -85,9 +85,40 @@ shared_expert_flops_per_input_row ~= 4 * D * H_shared for FFN shared expert
 shared_expert_flops_per_input_row ~= 6 * D * H_shared for GLU shared expert
 ```
 
-These are approximate multiply-add FLOP counts. They are useful because they
-separate "more rows" from "more work per row." Cross-shape comparisons should
-therefore look at both latency per input row and compute-normalized throughput.
+The constants in these formulas come from weight count and multiply-add count:
+
+```text
+2 in FFN params:
+  an FFN expert has two learned matrices:
+  W1: D x H
+  W2: H x D
+  so params per expert ~= 2 * D * H
+
+3 in GLU params:
+  a GLU/SwiGLU expert has three learned matrices:
+  W_gate: D x H
+  W_up:   D x H
+  W_down: H x D
+  so params per expert ~= 3 * D * H
+
+2 in router flops:
+  one matrix multiply row x router_weight uses multiply-add accounting:
+  D multiplies + D adds per expert ~= 2 * D * E
+
+4 in FFN active expert flops:
+  two FFN matmuls, each ~= 2 * D * H
+  total per active expert ~= 4 * D * H
+
+6 in GLU active expert flops:
+  three GLU matmuls, each ~= 2 * D * H
+  total per active expert ~= 6 * D * H
+```
+
+These are approximate GEMM-centered FLOP counts. They intentionally ignore
+smaller elementwise work such as activation, GLU multiply, bias add, top-k, and
+scatter/gather indexing. They are useful because they separate "more rows" from
+"more work per row." Cross-shape comparisons should therefore look at both
+latency per input row and compute-normalized throughput.
 
 MegaBlocks can be fed these shape fields through `Arguments`. For Level 1 shape
 simulation, we use synthetic weights with the model's MoE shape:
@@ -127,6 +158,10 @@ shared_expert_hidden_size = H_shared when shared_expert is true
 fp16 / bf16 dtype flags
 device
 ```
+
+`mlp_type` is the expert formula type, not a separate routing type, `mlp_type="mlp"` means
+a two-matmul FFN expert, while `mlp_type="glu"` means a three-projection
+GLU/SwiGLU-style expert.
 
 The required learned tensors are:
 
@@ -268,6 +303,68 @@ no custom MegaBlocks exponential/softmax kernel in this path. Optional jitter,
 expert-weight normalization, and uniform benchmark assignment are also handled
 inside `LearnedRouter`.
 
+### Softmax Implementation
+
+In stock MegaBlocks routing, softmax is implemented by PyTorch, not by a
+MegaBlocks custom kernel:
+
+```text
+scores = logits.softmax(dim=-1)
+```
+
+Source:
+
+```text
+third_party/megablocks/megablocks/layers/router.py:96
+third_party/megablocks/megablocks/layers/router.py:98
+```
+
+Mathematically, this means the router converts each input row's expert logits
+into probabilities across the `E` routed experts:
+
+```text
+scores[n, e] = exp(logits[n, e]) / sum_j exp(logits[n, j])
+```
+
+Then MegaBlocks selects top-k experts from those probabilities:
+
+```text
+expert_weights, expert_indices = topk(scores, K)
+```
+
+Source:
+
+```text
+third_party/megablocks/megablocks/layers/router.py:87
+third_party/megablocks/megablocks/layers/router.py:90
+third_party/megablocks/megablocks/layers/router.py:99
+```
+
+If `moe_normalize_expert_weights` is set, MegaBlocks normalizes the selected
+expert weights after top-k:
+
+```text
+expert_weights = expert_weights / norm(expert_weights, p=moe_normalize_expert_weights)
+```
+
+Source:
+
+```text
+third_party/megablocks/megablocks/layers/router.py:100
+third_party/megablocks/megablocks/layers/router.py:101
+third_party/megablocks/megablocks/layers/router.py:102
+third_party/megablocks/megablocks/layers/router.py:103
+third_party/megablocks/megablocks/layers/router.py:104
+third_party/megablocks/megablocks/layers/router.py:105
+```
+
+For our current profiler's `megablocks_core` timing scope, routing is prepared
+outside the timed loop. That means the measured MegaBlocks core latency excludes
+router linear, softmax, top-k, and adapter aux-loss setup. The timed core path
+starts from already-computed `router_probs`, `gates`, and `indices`, then
+measures expert dispatch, gather, expert compute, scatter, and shared expert
+work if configured.
+
 ### Our Adapter Router Semantics
 
 For Nano-compatible and Level 1 synthetic profiling, our adapter does not call
@@ -285,6 +382,15 @@ The adapter routing convention is:
 router_probs = softmax(logits)
 top_indices = topk(logits, K)
 gates = softmax(top-k logits)
+```
+
+Source:
+
+```text
+src/profiling/profile_moe_layer.py:826
+src/profiling/profile_moe_layer.py:827
+src/profiling/profile_moe_layer.py:828
+src/profiling/profile_moe_layer.py:829
 ```
 
 This differs from stock MegaBlocks, which selects top-k over `softmax(logits)`.
@@ -528,6 +634,20 @@ Source:
 third_party/megablocks/megablocks/layers/mlp.py:499
 ```
 
+"Grouped MLP" means the expert MLP is executed with grouped GEMM. After routing,
+MegaBlocks has one concatenated tensor of routed rows:
+
+```text
+x_grouped: (N*K, D)
+tokens_per_expert: length E
+```
+
+`tokens_per_expert` tells grouped GEMM how many rows belong to each expert. The
+kernel then runs the expert-specific GEMMs as a group of independent matrix
+multiplies with different row counts. This is different from standard `moe`,
+which pads every expert to the busiest expert's capacity and runs dense
+`torch.bmm` over a rectangular `(E, expert_capacity, D)` tensor.
+
 Grouped GLU math:
 
 ```text
@@ -590,6 +710,86 @@ third_party/megablocks/megablocks/layers/glu.py:208
 
 This is relevant for DeepSeek-shaped simulation because the catalog shape has a
 shared expert component in addition to routed experts.
+
+### Activation And GELU Implementation
+
+MegaBlocks does not hard-code GELU inside the router or dispatch kernels. The
+expert module receives an `activation_fn` callable through `Arguments`:
+
+```text
+third_party/megablocks/megablocks/layers/arguments.py:19
+third_party/megablocks/megablocks/layers/arguments.py:30
+```
+
+The default is:
+
+```text
+activation_fn = partial(torch.nn.functional.gelu, approximate="tanh")
+```
+
+That is the tanh-approximate GELU:
+
+```text
+gelu_tanh(x) ~= 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+```
+
+For the dense standard `moe` expert MLP, MegaBlocks applies this callable after
+the first `torch.bmm`:
+
+```text
+third_party/megablocks/megablocks/layers/mlp.py:162
+third_party/megablocks/megablocks/layers/mlp.py:165
+third_party/megablocks/megablocks/layers/mlp.py:166
+```
+
+For grouped dMoE MLP, it applies the same callable after the first grouped GEMM:
+
+```text
+third_party/megablocks/megablocks/layers/mlp.py:519
+third_party/megablocks/megablocks/layers/mlp.py:521
+third_party/megablocks/megablocks/layers/mlp.py:522
+```
+
+For grouped dMoE GLU, it applies the callable to the gate projection, multiplies
+by the up projection, then runs the down projection:
+
+```text
+third_party/megablocks/megablocks/layers/glu.py:200
+third_party/megablocks/megablocks/layers/glu.py:202
+third_party/megablocks/megablocks/layers/glu.py:203
+third_party/megablocks/megablocks/layers/glu.py:204
+third_party/megablocks/megablocks/layers/glu.py:205
+```
+
+The sparse STK path has a wrapper named `megablocks.layers.gelu.gelu`, but that
+wrapper still calls PyTorch GELU on the sparse matrix data:
+
+```text
+third_party/megablocks/megablocks/layers/gelu.py:32
+third_party/megablocks/megablocks/layers/gelu.py:36
+```
+
+Its custom backward uses the derivative of the same tanh approximation:
+
+```text
+third_party/megablocks/megablocks/layers/gelu.py:10
+third_party/megablocks/megablocks/layers/gelu.py:11
+third_party/megablocks/megablocks/layers/gelu.py:12
+```
+
+Our profiler maps catalog activations in the same way:
+
+```text
+src/profiling/profile_moe_layer.py:109
+src/profiling/profile_moe_layer.py:110
+src/profiling/profile_moe_layer.py:111
+src/profiling/profile_moe_layer.py:112
+src/profiling/profile_moe_layer.py:113
+```
+
+So for Nano-shaped runs with `activation="gelu_tanh"`, the activation is
+PyTorch `F.gelu(..., approximate="tanh")`. For OLMoE-shaped GLU runs with
+`activation="silu"`, it is PyTorch `F.silu`.
 
 ### Kernel And Library Responsibilities
 
@@ -807,6 +1007,8 @@ third_party/megablocks/megablocks/layers/moe.py
 third_party/megablocks/megablocks/layers/dmoe.py
 third_party/megablocks/megablocks/layers/mlp.py
 third_party/megablocks/megablocks/layers/glu.py
+third_party/megablocks/megablocks/layers/activation_fn.py
+third_party/megablocks/megablocks/layers/gelu.py
 third_party/megablocks/megablocks/layers/sharedexpert_registry.py
 third_party/megablocks/megablocks/backend/kernels.py
 third_party/megablocks/megablocks/ops/

@@ -63,7 +63,7 @@ def case_namespace(args: argparse.Namespace, **overrides) -> Namespace:
         "iters": 0,
         "trials": 1,
         "seed": args.seed,
-        "timing_scope": "adapter_boundary",
+        "timing_scope": "moe_layer",
         "weight_source": args.weight_source,
         "nano_jax_dir": args.nano_jax_dir,
         "zero_expert_biases": args.zero_expert_biases,
