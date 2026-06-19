@@ -1,0 +1,10 @@
+{
+  "clock_query_status": "ok",
+  "compute_capability": "8.6",
+  "current_sm_clock_mhz": 225.0,
+  "gpu_metadata_status": "ok",
+  "gpu_name": "NVIDIA GeForce RTX 3080",
+  "max_sm_clock_mhz": 2115.0,
+  "sm_count": 68,
+  "total_memory_bytes": 10351935488
+}

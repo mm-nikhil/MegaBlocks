@@ -10,6 +10,12 @@ import torch
 import torch.nn.functional as F
 
 
+# The local grouped_gemm extension used by MegaBlocks dMoE validates BF16 input,
+# weight, and output tensors in C++. Keep the fallback named and visible so a
+# mixed FP32/BF16 run does not look like one homogeneous dtype experiment.
+DMOE_BF16_ONLY_DTYPE_POLICY = "dmoe_bf16_only_local_grouped_gemm"
+
+
 def parse_dtype(name: str) -> torch.dtype:
     """Map the CLI dtype name to the torch dtype used for tensors and modules."""
 
@@ -28,6 +34,19 @@ def dtype_nbytes(dtype: torch.dtype) -> int:
         torch.float16: 2,
         torch.bfloat16: 2,
     }[dtype]
+
+
+def resolve_backend_dtype(backend: str, requested_dtype: str) -> tuple[str, str]:
+    """Return the effective dtype and the policy that selected it.
+
+    NanoJAX runs should request FP32 by default. The exception is
+    ``megablocks_dmoe`` in this checkout: its grouped GEMM backend is BF16-only,
+    so dMoE rows are deliberately recorded as BF16 with an explicit policy.
+    """
+
+    if backend == "megablocks_dmoe" and requested_dtype != "bfloat16":
+        return "bfloat16", DMOE_BF16_ONLY_DTYPE_POLICY
+    return requested_dtype, "requested"
 
 
 def activation_fn_from_name(name: str):
@@ -85,4 +104,3 @@ def load_model_shape(args: argparse.Namespace) -> dict[str, object]:
             + "; ".join(mismatches),
         )
     return dict(shape)
-

@@ -142,13 +142,16 @@ def measure_megablocks_moe_ops(
 ) -> dict[str, float | int | str | bool]:
     """Replay logical MoE-layer operations for presentation-level diagnostics.
 
-    This view follows the MoE layer boundary: router projection, top-k,
-    selected-logit softmax/gating, MegaBlocks expert path, and final layout. The
-    gate/combine field is a subset timing from the expert path, so it should not
-    be added to the expert-block timing.
+    This view follows the MoE layer boundary using disjoint logical blocks:
+    input layout, router projection matmul, full row-wise router softmax,
+    top-k expert selection, row-wise selected-logit softmax for gate weights,
+    aux/router bookkeeping, MegaBlocks expert block, and output layout. The
+    expert block contains dispatch/sort/binning, gather, expert MLP compute,
+    and weighted scatter/combine. The component sum is useful for explanation,
+    but it is still a replay diagnostic: splitting kernels can change launch
+    behavior, so the authoritative latency remains ``mean_forward_ms`` from
+    the timed whole layer.
     """
-
-    from megablocks import ops
 
     if args.moe_op_iters < 1:
         raise RuntimeError("--moe-op-iters must be >= 1.")
@@ -159,13 +162,22 @@ def measure_megablocks_moe_ops(
     def time_cuda(fn) -> float:
         return cuda_time_ms(fn, warmup=warmup, iters=iters, device=device)
 
-    x_mb = x.transpose(0, 1).contiguous()
+    def input_layout():
+        return x.transpose(0, 1).contiguous()
+
+    input_layout_ms = time_cuda(input_layout)
+    x_mb = input_layout()
     flat_x = x_mb.view(-1, x_mb.shape[-1])
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
     router_projection_ms = time_cuda(lambda: layer.router.layer(flat_x))
     logits = layer.router.layer(flat_x)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    router_full_softmax_ms = time_cuda(lambda: torch.softmax(logits, dim=-1))
+    router_probs = torch.softmax(logits, dim=-1)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
@@ -176,7 +188,12 @@ def measure_megablocks_moe_ops(
 
     selected_softmax_gating_ms = time_cuda(lambda: torch.softmax(top_values, dim=-1))
     gates = torch.softmax(top_values, dim=-1)
-    router_probs = torch.softmax(logits, dim=-1)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    router_aux_loss_ms = time_cuda(
+        lambda: nano_aux_loss_from_router(router_probs, top_indices, args.n_experts),
+    )
     aux_loss = nano_aux_loss_from_router(router_probs, top_indices, args.n_experts)
     routing = MegaBlocksRouting(
         x_mb=x_mb,
@@ -188,74 +205,90 @@ def measure_megablocks_moe_ops(
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
-    expert_block_ms = time_cuda(lambda: megablocks_expert_dispatch(layer, routing))
-    expert_block_out = megablocks_expert_dispatch(layer, routing)
+    expert_path_ms = time_cuda(lambda: megablocks_expert_dispatch(layer, routing))
+    expert_path_out = megablocks_expert_dispatch(layer, routing)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
-    experts = layer.experts
-    top_experts = routing.indices.flatten().int()
-    expert_weights = routing.gates.flatten()
-    top_k = args.top_k
-
-    bin_ids, indices = ops.sort(top_experts, experts.sort_end_bit)
-    tokens_per_expert = ops.histogram(top_experts, experts.num_experts)
-    bins = promote_scalar_tensor(ops.inclusive_cumsum(tokens_per_expert, 0))
+    output_layout_ms = time_cuda(lambda: expert_path_out.transpose(0, 1).contiguous())
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
+    def whole_moe_layer_replay():
+        replay_x_mb = x.transpose(0, 1).contiguous()
+        replay_flat_x = replay_x_mb.view(-1, replay_x_mb.shape[-1])
+        replay_logits = layer.router.layer(replay_flat_x)
+        replay_router_probs = torch.softmax(replay_logits, dim=-1)
+        replay_top_values, replay_top_indices = torch.topk(replay_logits, args.top_k, dim=-1)
+        replay_gates = torch.softmax(replay_top_values, dim=-1)
+        replay_aux_loss = nano_aux_loss_from_router(
+            replay_router_probs,
+            replay_top_indices,
+            args.n_experts,
+        )
+        replay_routing = MegaBlocksRouting(
+            x_mb=replay_x_mb,
+            router_probs=replay_router_probs,
+            gates=replay_gates,
+            indices=replay_top_indices,
+            aux_loss=replay_aux_loss,
+        )
+        replay_out = megablocks_expert_dispatch(layer, replay_routing)
+        return replay_out.transpose(0, 1).contiguous(), replay_aux_loss
+
+    whole_moe_layer_replay_ms = time_cuda(whole_moe_layer_replay)
+
+    tokens_per_expert = torch.bincount(routing.indices.flatten().to(torch.long), minlength=args.n_experts)
     if args.megablocks_layer == "moe":
-        expert_capacity = experts.expert_capacity(args.batch_size * args.seq_len)
+        expert_capacity = layer.experts.expert_capacity(args.batch_size * args.seq_len)
         if expert_capacity == 0:
             expert_capacity = int(torch.max(tokens_per_expert).item())
-        gathered = ops.binned_gather(flat_x, indices, bins, expert_capacity, top_k)
-        expert_out = experts.mlp(gathered)
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        gate_combine_ms = time_cuda(
-            lambda: ops.binned_scatter(expert_out, indices, expert_weights, bins, top_k),
-        )
         op_path = "standard_moe_binned"
     elif args.megablocks_layer == "dmoe":
         expert_capacity = 0
-        gathered = ops.gather(flat_x, indices, bin_ids, bins, top_k)
-        expert_out = experts.mlp(gathered, tokens_per_expert)
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        gate_combine_ms = time_cuda(
-            lambda: ops.scatter(expert_out, indices, bin_ids, expert_weights, bins, top_k),
-        )
         op_path = "dmoe_grouped"
     else:
         raise RuntimeError(f"Unsupported MegaBlocks layer for MoE op profiling: {args.megablocks_layer}")
 
-    output_layout_ms = time_cuda(lambda: expert_block_out.transpose(0, 1).contiguous())
-    non_additive_sum_ms = (
-        router_projection_ms
+    disjoint_replay_sum_ms = (
+        input_layout_ms
+        + router_projection_ms
+        + router_full_softmax_ms
         + topk_selection_ms
         + selected_softmax_gating_ms
-        + expert_block_ms
+        + router_aux_loss_ms
+        + expert_path_ms
         + output_layout_ms
     )
+    replay_sum_minus_whole_ms = disjoint_replay_sum_ms - whole_moe_layer_replay_ms
 
     return {
         "moe_op_profile": True,
-        "moe_op_profile_scope": "moe_layer_logical_replay",
+        "moe_op_profile_scope": "moe_layer_disjoint_replay",
         "moe_op_profile_warmup": warmup,
         "moe_op_profile_iters": iters,
         "moe_op_path": op_path,
         "moe_op_expert_capacity": int(expert_capacity),
+        "moe_op_input_layout_to_megablocks_ms": float(input_layout_ms),
         "moe_op_router_projection_matmul_ms": float(router_projection_ms),
+        "moe_op_router_full_softmax_ms": float(router_full_softmax_ms),
         "moe_op_topk_selection_ms": float(topk_selection_ms),
         "moe_op_selected_softmax_gating_ms": float(selected_softmax_gating_ms),
-        "moe_op_expert_block_dispatch_compute_combine_ms": float(expert_block_ms),
-        "moe_op_gate_multiply_combine_ms": float(gate_combine_ms),
+        "moe_op_router_aux_loss_ms": float(router_aux_loss_ms),
+        "moe_op_expert_path_dispatch_compute_combine_ms": float(expert_path_ms),
+        "moe_op_expert_block_dispatch_compute_combine_ms": float(expert_path_ms),
         "moe_op_output_layout_to_nano_ms": float(output_layout_ms),
-        "moe_op_main_replay_sum_ms": float(non_additive_sum_ms),
+        "moe_op_disjoint_replay_sum_ms": float(disjoint_replay_sum_ms),
+        "moe_op_whole_moe_layer_replay_ms": float(whole_moe_layer_replay_ms),
+        "moe_op_replay_sum_minus_whole_ms": float(replay_sum_minus_whole_ms),
+        "moe_op_main_replay_sum_ms": float(disjoint_replay_sum_ms),
         "moe_op_profile_note": (
-            "Independent diagnostic timings. expert_block is the whole "
-            "MegaBlocks expert path; gate_multiply_combine is the weighted "
-            "scatter/combine subset and is not additive with expert_block."
+            "Disjoint diagnostic replay. Components are non-overlapping logical "
+            "MoE blocks and their sum is reported, but split replay is not the "
+            "authoritative production latency. Use mean_forward_ms for whole-layer "
+            "latency. expert_path is one real MegaBlocks dispatch/sort/gather, "
+            "expert MLP, and weighted scatter/combine unit. Gate multiply is folded "
+            "into weighted scatter/combine. Lower-level gather/MLP/scatter timings "
+            "require --phase-profile."
         ),
     }
-

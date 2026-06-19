@@ -31,6 +31,7 @@ from moe_profile.terms import (
     TIMING_SCOPE_CHOICES,
     TIMING_SCOPE_EXPERT_PATH,
     TIMING_SCOPE_HELP,
+    moe_semantic_record,
     resolve_timing_scope,
     require_valid_timing_scope,
 )
@@ -52,6 +53,16 @@ def parse_args() -> argparse.Namespace:
         choices=("float32", "float16", "bfloat16"),
         default="float16",
         help="Activation and weight dtype used by the profiled torch/MegaBlocks layer.",
+    )
+    parser.add_argument(
+        "--requested-dtype",
+        default="",
+        help="Original run-level dtype request; useful when a backend has a dtype-specific fallback.",
+    )
+    parser.add_argument(
+        "--dtype-policy",
+        default="requested",
+        help="Why the effective dtype was selected, e.g. requested or dmoe_bf16_only_local_grouped_gemm.",
     )
     parser.add_argument("--device", default="cuda", help="Torch device for timing, usually cuda.")
     parser.add_argument("--warmup", type=int, default=20, help="Untimed warmup iterations before each trial.")
@@ -97,7 +108,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--moe-op-profile",
         action="store_true",
-        help="Collect logical MoE-layer op timings: router, top-k, gating, expert path, combine/layout.",
+        help=(
+            "Collect logical MoE-layer op timings: router projection, row-wise "
+            "softmax, top-k, selected-gate softmax, expert block, weighted "
+            "scatter/combine, and layout."
+        ),
     )
     parser.add_argument("--moe-op-warmup", type=int, default=5)
     parser.add_argument("--moe-op-iters", type=int, default=20)
@@ -286,6 +301,8 @@ def main() -> None:
         "megablocks_layer": args.megablocks_layer if args.backend == "megablocks" else None,
         "device": str(device),
         "dtype": args.dtype,
+        "requested_dtype": args.requested_dtype or args.dtype,
+        "dtype_policy": args.dtype_policy,
         "batch_size": args.batch_size,
         "seq_len": args.seq_len,
         "tokens": tokens,
@@ -297,6 +314,7 @@ def main() -> None:
         "shared_expert_intermediate_size": shared_hidden,
         "expert_type": expert_type,
         "activation": activation,
+        **moe_semantic_record(expert_type=expert_type, activation=activation),
         "max_position_embeddings": max_position_embeddings,
         "warmup": args.warmup,
         "iters": args.iters,
@@ -346,14 +364,17 @@ def main() -> None:
         print(f"phase_scatter_ms: {phase_metrics['phase_scatter_ms']:.4f}")
     if moe_op_metrics:
         print(f"moe_op_profile_scope: {moe_op_metrics['moe_op_profile_scope']}")
+        print(f"moe_op_input_layout_to_megablocks_ms: {moe_op_metrics['moe_op_input_layout_to_megablocks_ms']:.4f}")
         print(f"moe_op_router_projection_matmul_ms: {moe_op_metrics['moe_op_router_projection_matmul_ms']:.4f}")
+        print(f"moe_op_router_full_softmax_ms: {moe_op_metrics['moe_op_router_full_softmax_ms']:.4f}")
         print(f"moe_op_topk_selection_ms: {moe_op_metrics['moe_op_topk_selection_ms']:.4f}")
         print(f"moe_op_selected_softmax_gating_ms: {moe_op_metrics['moe_op_selected_softmax_gating_ms']:.4f}")
         print(
-            "moe_op_expert_block_dispatch_compute_combine_ms: "
-            f"{moe_op_metrics['moe_op_expert_block_dispatch_compute_combine_ms']:.4f}",
+            "moe_op_expert_path_dispatch_compute_combine_ms: "
+            f"{moe_op_metrics['moe_op_expert_path_dispatch_compute_combine_ms']:.4f}",
         )
-        print(f"moe_op_gate_multiply_combine_ms: {moe_op_metrics['moe_op_gate_multiply_combine_ms']:.4f}")
+        print(f"moe_op_disjoint_replay_sum_ms: {moe_op_metrics['moe_op_disjoint_replay_sum_ms']:.4f}")
+        print(f"moe_op_whole_moe_layer_replay_ms: {moe_op_metrics['moe_op_whole_moe_layer_replay_ms']:.4f}")
     if args.jsonl_out is not None:
         args.jsonl_out.parent.mkdir(parents=True, exist_ok=True)
         with args.jsonl_out.open("a", encoding="utf-8") as handle:

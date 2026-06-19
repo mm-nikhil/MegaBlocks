@@ -1,4 +1,9 @@
-"""Nano-compatible adapter around MegaBlocks MoE and dMoE layers."""
+"""Nano-compatible adapter around MegaBlocks MoE and dMoE layers.
+
+The benchmark keeps NanoJAX MoE math fixed: router probabilities, selected
+experts, and selected-expert gates are computed with NanoJAX semantics, then
+MegaBlocks performs sparse dispatch, expert MLP execution, and weighted combine.
+"""
 
 from __future__ import annotations
 
@@ -280,7 +285,12 @@ def megablocks_prepare_routing(
     n_experts: int,
     top_k: int,
 ) -> MegaBlocksRouting:
-    """Compute Nano-compatible router logits, top-k choices, gates, and aux loss."""
+    """Compute Nano-compatible router logits, top-k choices, gates, and aux loss.
+
+    This is not the stock MegaBlocks router call. It intentionally exposes the
+    NanoJAX routing convention so correctness checks can compare router indices,
+    gates, auxiliary loss, and final output against the PyTorch reference.
+    """
 
     x_mb = x.transpose(0, 1).contiguous()
     flat_x = x_mb.view(-1, x_mb.shape[-1])
@@ -350,4 +360,3 @@ def megablocks_forward(
         indices=indices_btd,
         tokens_per_expert=tokens_per_expert,
     )
-

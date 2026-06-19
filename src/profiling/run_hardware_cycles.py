@@ -16,13 +16,17 @@ import argparse
 import csv
 import json
 import math
+import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Iterable
 
-from moe_profile.run_fields import MOE_OP_FIELDS
+from moe_profile.config import DMOE_BF16_ONLY_DTYPE_POLICY, resolve_backend_dtype
+from moe_profile.run_paths import validate_result_root
+from moe_profile.run_fields import MOE_OP_FIELDS, MOE_SEMANTIC_FIELDS
 from moe_profile.run_plots import save_moe_op_dashboard
+from moe_profile.verification import run_nanojax_correctness_gate
 
 
 DEFAULT_TOKENS = "512,1024,2048,4096,8192,16384"
@@ -38,6 +42,8 @@ SUMMARY_FIELDS = (
     "timing_scope",
     "weight_source",
     "dtype",
+    "requested_dtype",
+    "dtype_policy",
     "N",
     "batch_size",
     "seq_len",
@@ -45,6 +51,7 @@ SUMMARY_FIELDS = (
     "d_ff",
     "n_experts",
     "top_k",
+    *MOE_SEMANTIC_FIELDS,
     "mean_forward_ms",
     "active_expert_flops",
     "active_expert_flops_per_token",
@@ -83,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokens", default=DEFAULT_TOKENS)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--backends", default=DEFAULT_BACKENDS)
-    parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument("--dtype", help="Defaults to the selected model-shape catalog dtype.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--weight-source", default="trained_nano_checkpoint")
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("results/trained_nano_moe_checkpoint"))
@@ -95,8 +102,9 @@ def parse_args() -> argparse.Namespace:
         default="moe_layer",
         help=(
             "moe_layer is the full Nano-compatible MoE layer: router projection, "
-            "top-k, selected-logit softmax/gating, expert path, and output combine. "
-            "expert_path isolates the prepared MegaBlocks dispatch/expert/combine path."
+            "full row-wise router softmax, top-k, row-wise selected-logit softmax/gating, "
+            "MegaBlocks expert block, weighted scatter/combine, and output layout. "
+            "expert_path isolates the prepared MegaBlocks expert block."
         ),
     )
     parser.add_argument("--warmup", type=int, default=5)
@@ -149,6 +157,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-memory-preflight", action="store_true")
     parser.add_argument("--memory-preflight-fraction", type=float, default=0.90)
     parser.add_argument("--memory-preflight-safety-multiplier", type=float, default=1.35)
+    parser.add_argument(
+        "--allow-current-results",
+        action="store_true",
+        help="Allow writing directly under results/current. Normally promotion is manual after review.",
+    )
+    parser.add_argument(
+        "--allow-results-smoke",
+        action="store_true",
+        help="Allow smoke/test/debug result roots under results/. Prefer /tmp for smoke checks.",
+    )
+    parser.add_argument(
+        "--skip-correctness-gate",
+        "--no-verify",
+        dest="skip_correctness_gate",
+        action="store_true",
+        help="Skip the small-N NanoJAX correctness gate for quick exploratory runs.",
+    )
+    parser.add_argument(
+        "--correctness-batch-size",
+        type=int,
+        default=4,
+        help="Batch size for the mandatory small-N NanoJAX correctness gate.",
+    )
+    parser.add_argument(
+        "--correctness-seq-len",
+        type=int,
+        default=0,
+        help="Sequence length for the correctness gate; 0 uses --seq-len.",
+    )
+    parser.add_argument(
+        "--correctness-fp32-threshold",
+        type=float,
+        default=1e-3,
+        help="Max absolute error tolerance for the FP32 megablocks_moe correctness gate.",
+    )
+    parser.add_argument(
+        "--correctness-bf16-threshold",
+        type=float,
+        default=0.02,
+        help="Max absolute error tolerance for the BF16-only megablocks_dmoe correctness gate.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -394,7 +443,36 @@ def write_jsonl(rows: Iterable[dict], path: Path) -> None:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
 
-def save_dashboard(rows: list[dict], path: Path) -> None:
+def series_label(row: dict) -> str:
+    """Presentation label that keeps backend dtype visible in mixed runs."""
+
+    label = str(row.get("backend", "unknown"))
+    dtype = row.get("dtype")
+    policy = row.get("dtype_policy")
+    if dtype:
+        label += f" [{dtype}]"
+    if policy == DMOE_BF16_ONLY_DTYPE_POLICY:
+        label += " (BF16-only dMoE)"
+    elif policy and policy not in {"", "requested"}:
+        label += f" ({policy})"
+    return label
+
+
+def failure_summary_lines(failures: list[str]) -> list[str]:
+    """Condense backend failures for a short figure footer."""
+
+    first_failed: dict[str, int] = {}
+    for failure in failures:
+        match = re.search(r"N=(\d+)\s+backend=([^:]+)", failure)
+        if not match:
+            continue
+        tokens = int(match.group(1))
+        backend = match.group(2)
+        first_failed[backend] = min(tokens, first_failed.get(backend, tokens))
+    return [f"{backend}: first failed N={tokens}" for backend, tokens in sorted(first_failed.items())]
+
+
+def save_dashboard(rows: list[dict], path: Path, *, failures: list[str]) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -403,7 +481,7 @@ def save_dashboard(rows: list[dict], path: Path) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(18.0, 4.8))
     by_backend: dict[str, list[dict]] = {}
     for row in rows:
-        by_backend.setdefault(str(row["backend"]), []).append(row)
+        by_backend.setdefault(series_label(row), []).append(row)
 
     for backend, backend_rows in sorted(by_backend.items()):
         ordered = sorted(backend_rows, key=lambda item: int(item["N"]))
@@ -443,7 +521,7 @@ def save_dashboard(rows: list[dict], path: Path) -> None:
     if has_util_rows:
         axes[1].set_xscale("log", base=2)
         axes[1].set_xlabel("N input-token rows")
-        axes[1].set_ylabel("clock-derived compute utilization (%)")
+        axes[1].set_ylabel("clock-derived compute-slot utilization (%)")
         axes[1].grid(True, color="0.9")
         axes[1].legend()
     else:
@@ -461,7 +539,7 @@ def save_dashboard(rows: list[dict], path: Path) -> None:
     if has_unused_rows:
         axes[2].set_xscale("log", base=2)
         axes[2].set_xlabel("N input-token rows")
-        axes[2].set_ylabel("equivalent unused SMs")
+        axes[2].set_ylabel("equiv. unused compute slots (SMs)")
         axes[2].grid(True, color="0.9")
         axes[2].legend()
     else:
@@ -475,9 +553,51 @@ def save_dashboard(rows: list[dict], path: Path) -> None:
             transform=axes[2].transAxes,
         )
 
-    title_scope = rows[0].get("timing_scope", "unknown") if rows else "unknown"
-    fig.suptitle(f"Clock-Derived MoE Compute Utilization ({title_scope})", fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    if rows:
+        title_scope = rows[0].get("timing_scope", "unknown")
+        model_name = rows[0].get("model_shape_name", "unknown")
+        dtypes = ", ".join(sorted({str(row.get("dtype", "unknown")) for row in rows}))
+        requested = ", ".join(sorted({str(row.get("requested_dtype", row.get("dtype", "unknown"))) for row in rows}))
+        weights = ", ".join(sorted({str(row.get("weight_source", "unknown")) for row in rows}))
+        first = rows[0]
+        peak_tflops = first.get("clock_peak_tflops_per_second")
+        sm_clock = first.get("sm_clock_mhz")
+        sm_count = first.get("sm_count")
+        peak_per_sm_cycle = first.get("peak_flops_per_sm_cycle")
+    else:
+        title_scope = "unknown"
+        model_name = "unknown"
+        dtypes = "unknown"
+        requested = "unknown"
+        weights = "unknown"
+        peak_tflops = None
+        sm_clock = None
+        sm_count = None
+        peak_per_sm_cycle = None
+    if isinstance(peak_tflops, (float, int)):
+        denominator = (
+            f"denominator={float(peak_tflops):.2f} TFLOP/s "
+            f"({sm_clock} MHz x {sm_count} SM x {peak_per_sm_cycle} FLOP/SM-cycle)"
+        )
+    else:
+        denominator = "denominator unavailable"
+    fig.suptitle(
+        "Clock-Derived MoE Compute Utilization\n"
+        f"{model_name} | timing={title_scope}\n"
+        f"requested_dtype={requested} | effective_dtype={dtypes} | weights={weights}\n"
+        f"{denominator}",
+        fontsize=11,
+    )
+    footer_lines = failure_summary_lines(failures)
+    if footer_lines:
+        fig.text(
+            0.01,
+            0.015,
+            "Failures: " + "; ".join(footer_lines) + ". Details in backend_status.md.",
+            fontsize=8,
+            ha="left",
+        )
+    fig.tight_layout(rect=(0, 0.04 if footer_lines else 0, 1, 0.78))
     fig.savefig(path, dpi=170)
     plt.close(fig)
 
@@ -489,16 +609,20 @@ def write_notes(
     rows: list[dict],
     metadata: dict[str, object],
     failures: list[str],
+    requested_dtype: str,
 ) -> None:
     first = rows[0] if rows else {}
     timing_scope = resolved_timing_scope(args.timing_scope)
+    effective_dtypes = ", ".join(sorted({str(row.get("dtype", "unknown")) for row in rows})) if rows else "unknown"
     lines = [
         "# Hardware MoE Profile",
         "",
         f"model_shape_name: `{args.model_shape_name}`",
         f"timing_scope: `{timing_scope}`",
         f"weight_source: `{args.weight_source}`",
-        f"dtype: `{args.dtype}`",
+        f"requested_dtype: `{requested_dtype}`",
+        f"effective_dtypes: `{effective_dtypes}`",
+        f"correctness_gate: `{not args.skip_correctness_gate}`",
         "",
         "Metric:",
         "",
@@ -510,8 +634,10 @@ def write_notes(
         "- `P`: SM count / PE count.",
         "- `R`: assumed peak FLOPs per SM cycle.",
         "",
-        "This is clock-derived compute utilization, not observed GPU idle cycles,",
+        "This is clock-derived compute-slot utilization, not observed GPU idle cycles,",
         "SM active cycles, hardware occupancy, or measured memory stalls.",
+        "`clock_equivalent_unused_sms` is an algebraic compute-slot equivalent,",
+        "not a measurement of physically idle SMs.",
         "",
         "GPU and denominator:",
         "",
@@ -524,17 +650,44 @@ def write_notes(
         f"- peak FLOPs per SM-cycle: `{args.peak_flops_per_sm_cycle}`",
         f"- peak TFLOP/s: `{first.get('clock_peak_tflops_per_second', 'unknown')}`",
         "",
+        "For the default RTX 3080 FP32 presentation run, the denominator is the",
+        "configured CUDA-core roof:",
+        "",
+        "`max_sm_clock * SM_count * peak_flops_per_sm_cycle`",
+        "",
+        "With the local defaults this is `2115 MHz * 68 * 256 = 36.82 TFLOP/s`.",
+        "If BF16 dMoE rows appear in the same run, they are still normalized by",
+        "this configured denominator unless `--peak-flops-per-sm-cycle` is changed;",
+        "do not interpret that as a BF16 tensor-core roof.",
+        "",
         "Per-op timing diagnostics:",
         "",
-        "The optional `moe_op_*` fields are independent diagram-level replays.",
-        "They are separate from the clock-derived metric. The expert block timing",
-        "is the whole MegaBlocks expert dispatch/compute/combine call. The",
-        "`moe_op_gate_multiply_combine_ms` field times the weighted scatter/combine",
-        "subset, so it is not additive with the expert-block timing.",
+        "The optional `moe_op_*` fields are disjoint diagnostic replays of logical",
+        "MoE blocks. They are separate from the clock-derived metric. Their",
+        "component sum is useful for explanation, but the authoritative whole-layer",
+        "latency remains `mean_forward_ms`. The expert-block timing is the whole",
+        "MegaBlocks dispatch/sort/binning, gather, expert MLP, and weighted",
+        "scatter/combine call; lower-level gather/MLP/scatter diagnostics belong",
+        "to `--phase-profile`.",
         "",
         "The full presentation timing boundary is `moe_layer`:",
-        "router projection, top-k, selected-logit softmax/gating, expert block,",
-        "gate multiply, and combine back to Nano `[N x D]` layout.",
+        "router projection, full row-wise router softmax, top-k, row-wise",
+        "selected-logit softmax/gating, expert block, weighted scatter/combine,",
+        "and output layout back to Nano `[N x D]`.",
+        "",
+        "Dtype policy:",
+        "",
+        "The run-level NanoJAX dtype defaults to the model-shape catalog dtype.",
+        "For `megablocks_dmoe`, the local grouped GEMM extension is BF16-only,",
+        "so dMoE rows may use `dtype=bfloat16` with",
+        "`dtype_policy=dmoe_bf16_only_local_grouped_gemm` even when the requested",
+        "NanoJAX dtype is FP32. The hardware denominator remains the configured",
+        "`peak_flops_per_sm_cycle`; mixed-dtype rows should be interpreted with",
+        "that assumption visible.",
+        "",
+        "NanoJAX correctness is checked once before the sweep and recorded in",
+        "`verification_summary.json` and `verification_summary.md`. Large hardware",
+        "rows do not run dense reference checks row-by-row.",
         "",
     ]
     if failures:
@@ -552,7 +705,7 @@ def write_backend_status(path: Path, rows: list[dict], failures: list[str], requ
 
     max_by_backend: dict[str, int] = {}
     for row in rows:
-        backend = str(row.get("backend", "unknown"))
+        backend = series_label(row)
         max_by_backend[backend] = max(max_by_backend.get(backend, 0), int(row["N"]))
 
     lines = [
@@ -579,8 +732,14 @@ def main() -> None:
     args = parse_args()
     shape = load_shape(args.model_shapes_config, args.model_shape_name)
     timing_scope = resolved_timing_scope(args.timing_scope)
+    requested_dtype = args.dtype or str(shape["dtype"])
     tokens_grid = parse_csv_ints(args.tokens)
     backends = parse_csv_strings(args.backends)
+    validate_result_root(
+        args.result_root,
+        allow_current_results=args.allow_current_results,
+        allow_results_smoke=args.allow_results_smoke,
+    )
     result_dir = args.result_root / args.model_shape_name
     result_dir.mkdir(parents=True, exist_ok=True)
 
@@ -600,6 +759,26 @@ def main() -> None:
     )
     per_token_flops = active_expert_flops_per_token(shape)
     profile_script = Path(__file__).with_name("profile_moe_layer.py")
+    run_nanojax_correctness_gate(
+        result_dir=result_dir,
+        profile_script=profile_script,
+        model_shape_name=args.model_shape_name,
+        model_shapes_config=args.model_shapes_config,
+        shape=shape,
+        requested_backends=backends,
+        weight_source=args.weight_source,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_block_index=args.checkpoint_block_index,
+        nano_jax_dir=args.nano_jax_dir,
+        device=args.device,
+        seed=0,
+        verification_batch_size=args.correctness_batch_size,
+        verification_seq_len=args.correctness_seq_len or args.seq_len,
+        fp32_threshold=args.correctness_fp32_threshold,
+        bf16_threshold=args.correctness_bf16_threshold,
+        dry_run=args.dry_run,
+        skip=args.skip_correctness_gate,
+    )
 
     rows: list[dict] = []
     failures: list[str] = []
@@ -608,13 +787,14 @@ def main() -> None:
             raise SystemExit(f"N={tokens} is not divisible by seq_len={args.seq_len}")
         batch_size = tokens // args.seq_len
         for backend in backends:
+            effective_dtype, dtype_policy = resolve_backend_dtype(backend, requested_dtype)
             backend_cli, backend_name, megablocks_layer = backend_args(
                 backend,
                 allow_bias_mismatch=args.allow_bias_mismatch,
             )
             label = (
                 f"{args.model_shape_name}_{backend_name}_hardware_"
-                f"tok{tokens}_t{args.seq_len}_{args.dtype}_{args.weight_source}_{timing_scope}"
+                f"tok{tokens}_t{args.seq_len}_{effective_dtype}_{args.weight_source}_{timing_scope}"
             )
             common = [
                 *backend_cli,
@@ -635,7 +815,11 @@ def main() -> None:
                 "--top-k",
                 str(shape["num_experts_per_token"]),
                 "--dtype",
-                args.dtype,
+                effective_dtype,
+                "--requested-dtype",
+                requested_dtype,
+                "--dtype-policy",
+                dtype_policy,
                 "--device",
                 args.device,
                 "--timing-scope",
@@ -675,7 +859,11 @@ def main() -> None:
             ])
 
             timing_raw = result_dir / f"timing_{backend_name}_N{tokens}.jsonl"
-            print(f"N={tokens} backend={backend_name} timing_scope={timing_scope}", flush=True)
+            print(
+                f"N={tokens} backend={backend_name} dtype={effective_dtype} "
+                f"timing_scope={timing_scope}",
+                flush=True,
+            )
             try:
                 timing_row, _, _, command_text = run_json_profile(
                     profile_script=profile_script,
@@ -687,6 +875,12 @@ def main() -> None:
                 failure = f"N={tokens} backend={backend_name}: {exc}"
                 failures.append(failure)
                 print(f"  failed {failure}", flush=True)
+                continue
+            # Dry-runs are command previews only. Do not fabricate metric rows
+            # from placeholder profiler output, because that can produce
+            # misleading dashboards and summaries.
+            if args.dry_run:
+                print(command_text, flush=True)
                 continue
 
             active_flops = int(tokens * per_token_flops)
@@ -705,7 +899,9 @@ def main() -> None:
                 "megablocks_layer": megablocks_layer,
                 "timing_scope": timing_scope,
                 "weight_source": args.weight_source,
-                "dtype": args.dtype,
+                "dtype": effective_dtype,
+                "requested_dtype": requested_dtype,
+                "dtype_policy": dtype_policy,
                 "N": tokens,
                 "batch_size": batch_size,
                 "seq_len": args.seq_len,
@@ -725,45 +921,76 @@ def main() -> None:
             for key in MOE_OP_FIELDS:
                 if key in timing_row:
                     row[key] = timing_row[key]
+            for key in MOE_SEMANTIC_FIELDS:
+                if key in timing_row:
+                    row[key] = timing_row[key]
             rows.append(row)
             util = row.get("clock_compute_util_pct")
             util_text = f"{float(util):.2f}%" if isinstance(util, (float, int)) else "n/a"
             print(f"  done ms={row['mean_forward_ms']} clock_compute_util={util_text}", flush=True)
 
+    if args.dry_run:
+        print("dry_run_complete")
+        return
+
     raw_path = result_dir / "raw.jsonl"
     summary_path = result_dir / "summary.csv"
     dashboard_path = result_dir / "graphs_clock_compute.png"
-    legacy_dashboard_path = result_dir / "dashboard.png"
-    moe_op_dashboard_path = result_dir / "graphs_moe_ops.png"
+    moe_op_dashboard_path = result_dir / "graphs_moe_layer_ops.png"
+    legacy_graph_paths = (
+        result_dir / "dashboard.png",
+        result_dir / "graphs_moe_ops.png",
+    )
     notes_path = result_dir / "notes.md"
     backend_status_path = result_dir / "backend_status.md"
     config_path = result_dir / "config.json"
     metadata_path = result_dir / "gpu_metadata.json"
 
+    for stale_graph_path in legacy_graph_paths:
+        if stale_graph_path.exists():
+            stale_graph_path.unlink()
+
     write_jsonl(rows, raw_path)
     write_csv(rows, summary_path)
-    save_dashboard(rows, dashboard_path)
-    save_dashboard(rows, legacy_dashboard_path)
+    save_dashboard(rows, dashboard_path, failures=failures)
     wrote_moe_op_dashboard = save_moe_op_dashboard(
         rows,
         moe_op_dashboard_path,
         x_key="N",
         series_key="backend",
-        title="MoE Layer Operation Profile",
+        title=(
+            "MoE Layer Operation Profile\n"
+            f"{args.model_shape_name} | requested_dtype={requested_dtype} | weights={args.weight_source}"
+        ),
     )
-    write_notes(notes_path, args=args, rows=rows, metadata=metadata, failures=failures)
+    write_notes(
+        notes_path,
+        args=args,
+        rows=rows,
+        metadata=metadata,
+        failures=failures,
+        requested_dtype=requested_dtype,
+    )
     write_backend_status(backend_status_path, rows, failures, backends)
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     config_path.write_text(
         json.dumps(
             {
                 "model_shape_name": args.model_shape_name,
+                "result_root": str(args.result_root),
+                "result_dir": str(result_dir),
+                "result_layout": "result_root/model_shape_name",
+                "graph_outputs": {
+                    "clock_compute": str(dashboard_path),
+                    "moe_layer_ops": str(moe_op_dashboard_path),
+                },
                 "tokens": tokens_grid,
                 "backends": backends,
                 "timing_scope": timing_scope,
                 "requested_timing_scope": args.timing_scope,
                 "weight_source": args.weight_source,
-                "dtype": args.dtype,
+                "requested_dtype": requested_dtype,
+                "effective_dtypes": sorted({str(row.get("dtype", "unknown")) for row in rows}),
                 "clock_source": args.clock_source,
                 "sm_clock_mhz": sm_clock_mhz,
                 "sm_clock_source": sm_clock_source,
@@ -777,6 +1004,11 @@ def main() -> None:
                 "skip_memory_preflight": args.skip_memory_preflight,
                 "memory_preflight_fraction": args.memory_preflight_fraction,
                 "memory_preflight_safety_multiplier": args.memory_preflight_safety_multiplier,
+                "skip_correctness_gate": args.skip_correctness_gate,
+                "correctness_batch_size": args.correctness_batch_size,
+                "correctness_seq_len": args.correctness_seq_len or args.seq_len,
+                "correctness_fp32_threshold": args.correctness_fp32_threshold,
+                "correctness_bf16_threshold": args.correctness_bf16_threshold,
                 "gpu_metadata": metadata,
             },
             indent=2,
@@ -787,9 +1019,9 @@ def main() -> None:
     )
     print(f"raw_jsonl={raw_path}")
     print(f"summary_csv={summary_path}")
-    print(f"dashboard={dashboard_path}")
+    print(f"clock_compute_graph={dashboard_path}")
     if wrote_moe_op_dashboard:
-        print(f"moe_op_dashboard={moe_op_dashboard_path}")
+        print(f"moe_layer_ops_graph={moe_op_dashboard_path}")
     print(f"notes={notes_path}")
     print(f"backend_status={backend_status_path}")
     print(f"gpu_metadata={metadata_path}")

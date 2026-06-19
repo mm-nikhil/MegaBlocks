@@ -43,9 +43,27 @@ Remaining limits:
   extension.
 - BF16 rows may need a dtype-specific numeric tolerance for expert-path
   differences.
-- Default profiling timing uses `megablocks_core`, so Nano-compatible routing is
-  prepared outside the timed region and the timed region is MegaBlocks
-  dispatch/expert/combine.
+- `moe_layer` timing includes Nano-compatible routing plus the MegaBlocks expert
+  block. `expert_path` timing starts after routing has been prepared and measures
+  MegaBlocks dispatch/sort/binning, gather, expert MLP, and weighted
+  scatter/combine.
+
+## Benchmark Path
+
+The benchmark uses one MoE execution convention so the result does not mix model
+semantics:
+
+- Router projection runs with NanoJAX checkpoint weights.
+- Full row-wise softmax is computed for router probabilities and auxiliary
+  load-balancing loss.
+- Top-k expert selection is computed over raw router logits.
+- Gate weights are a row-wise softmax over the selected top-k logits.
+- MegaBlocks receives the selected expert indices and gates and performs sparse
+  dispatch, expert MLP compute, and weighted scatter/combine.
+
+This keeps the model behavior fixed across the PyTorch reference, MegaBlocks
+MoE, and MegaBlocks dMoE lines. The comparison is therefore about implementation
+performance, not about changing the router definition.
 
 ## Interpretation Rule
 

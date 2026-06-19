@@ -1,6 +1,5 @@
 {
   "backends": [
-    "reference",
     "megablocks_moe",
     "megablocks_dmoe"
   ],
@@ -13,17 +12,17 @@
   "device": "cuda",
   "dtype": "float32",
   "graph_outputs": {
-    "expert_path_phases": "results/new/token_capacity/nano_moe_jax/graphs_expert_path_phases.png",
-    "moe_layer_ops": "results/new/token_capacity/nano_moe_jax/graphs_moe_layer_ops.png",
-    "token_capacity": "results/new/token_capacity/nano_moe_jax/graphs_token_capacity.png"
+    "expert_path_phases": "results/new/moe_ops/nano_moe_jax/graphs_expert_path_phases.png",
+    "moe_layer_ops": "results/new/moe_ops/nano_moe_jax/graphs_moe_layer_ops.png",
+    "token_capacity": "results/new/moe_ops/nano_moe_jax/graphs_token_capacity.png"
   },
-  "iters": 50,
+  "iters": 20,
   "memory_preflight_fraction": 0.9,
   "memory_preflight_safety_multiplier": 1.35,
   "model_shape_name": "nano_moe_jax",
   "model_shapes_config": "configs/moe_model_shapes.json",
   "moe_op_iters": 20,
-  "moe_op_profile": false,
+  "moe_op_profile": true,
   "moe_op_warmup": 5,
   "outlier_abs_threshold": 0.001,
   "phase_iters": 20,
@@ -31,9 +30,9 @@
   "phase_warmup": 5,
   "plot_mode": "token_capacity",
   "requested_dtype": "float32",
-  "result_dir": "results/new/token_capacity/nano_moe_jax",
+  "result_dir": "results/new/moe_ops/nano_moe_jax",
   "result_layout": "result_root/model_shape_name",
-  "result_root": "results/new/token_capacity",
+  "result_root": "results/new/moe_ops",
   "row_check_output": false,
   "seq_len": 128,
   "shape": {
@@ -72,7 +71,7 @@
     524288,
     1048576
   ],
-  "trials": 3,
-  "warmup": 10,
+  "trials": 2,
+  "warmup": 5,
   "weight_source": "trained_nano_checkpoint"
 }

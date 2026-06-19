@@ -1,0 +1,58 @@
+{
+  "cases": [
+    {
+      "aux_loss_abs_diff": 0.0,
+      "backend": "megablocks_moe",
+      "case_id": "nanojax_fp32_megablocks_moe",
+      "command": "/home/nikhil/workspace/MegaBlocks/.venv/bin/python /home/nikhil/workspace/MegaBlocks/src/profiling/profile_moe_layer.py --backend megablocks --megablocks-layer moe --model-shape-name nano_moe_jax --model-shapes-config configs/moe_model_shapes.json --batch-size 4 --seq-len 128 --d-model 128 --d-ff 512 --n-experts 4 --top-k 2 --dtype float32 --device cuda --seed 0 --timing-scope moe_layer --weight-source trained_nano_checkpoint --checkpoint-dir results/trained_nano_moe_checkpoint --checkpoint-block-index 0 --nano-jax-dir third_party/Nano-MoE-JAX --use-expert-biases --check-output --outlier-abs-threshold 0.001 --warmup 1 --iters 1 --trials 1 --jsonl-out results/new/moe_ops/nano_moe_jax/verification_nanojax_fp32_megablocks_moe.jsonl --label nanojax_fp32_megablocks_moe",
+      "correctness_passed": true,
+      "dtype": "float32",
+      "jsonl": "results/new/moe_ops/nano_moe_jax/verification_nanojax_fp32_megablocks_moe.jsonl",
+      "max_abs_vs_reference": 0.0,
+      "max_rel_vs_reference": 0.0,
+      "mean_abs_vs_reference": 0.0,
+      "megablocks_layer": "moe",
+      "note": "FP32 standard MoE adapter vs PyTorch NanoJAX reference.",
+      "outlier_abs_threshold": 0.001,
+      "outlier_diagnosis": "within_threshold",
+      "returncode": 0,
+      "router_expert_set_mismatch_count": 0,
+      "router_gate_max_abs": 0.0,
+      "status": "passed"
+    },
+    {
+      "aux_loss_abs_diff": 0.0,
+      "backend": "megablocks_dmoe",
+      "case_id": "nanojax_bf16_megablocks_dmoe",
+      "command": "/home/nikhil/workspace/MegaBlocks/.venv/bin/python /home/nikhil/workspace/MegaBlocks/src/profiling/profile_moe_layer.py --backend megablocks --megablocks-layer dmoe --model-shape-name nano_moe_jax --model-shapes-config configs/moe_model_shapes.json --batch-size 4 --seq-len 128 --d-model 128 --d-ff 512 --n-experts 4 --top-k 2 --dtype bfloat16 --device cuda --seed 0 --timing-scope moe_layer --weight-source trained_nano_checkpoint --checkpoint-dir results/trained_nano_moe_checkpoint --checkpoint-block-index 0 --nano-jax-dir third_party/Nano-MoE-JAX --use-expert-biases --check-output --outlier-abs-threshold 0.02 --warmup 1 --iters 1 --trials 1 --jsonl-out results/new/moe_ops/nano_moe_jax/verification_nanojax_bf16_megablocks_dmoe.jsonl --label nanojax_bf16_megablocks_dmoe",
+      "correctness_passed": true,
+      "dtype": "bfloat16",
+      "jsonl": "results/new/moe_ops/nano_moe_jax/verification_nanojax_bf16_megablocks_dmoe.jsonl",
+      "max_abs_vs_reference": 0.0,
+      "max_rel_vs_reference": 0.0,
+      "mean_abs_vs_reference": 0.0,
+      "megablocks_layer": "dmoe",
+      "note": "BF16-only dMoE adapter vs PyTorch NanoJAX reference; local grouped_gemm does not support FP32.",
+      "outlier_abs_threshold": 0.02,
+      "outlier_diagnosis": "within_threshold",
+      "returncode": 0,
+      "router_expert_set_mismatch_count": 0,
+      "router_gate_max_abs": 0.0,
+      "status": "passed"
+    }
+  ],
+  "checkpoint_block_index": 0,
+  "checkpoint_dir": "results/trained_nano_moe_checkpoint",
+  "generated_at_utc": "2026-06-19T14:08:43.038624+00:00",
+  "model_shape_name": "nano_moe_jax",
+  "requested_backends": [
+    "megablocks_moe",
+    "megablocks_dmoe"
+  ],
+  "simulation_level": "exact_adapter",
+  "status": "passed",
+  "verification_batch_size": 4,
+  "verification_seq_len": 128,
+  "verification_tokens": 512,
+  "weight_source": "trained_nano_checkpoint"
+}

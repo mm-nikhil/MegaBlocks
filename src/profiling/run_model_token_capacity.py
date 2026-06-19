@@ -1,9 +1,9 @@
-"""Run the first-cut model token-capacity sweep.
+"""Run model token-capacity and MoE diagnostic sweeps.
 
 This is intentionally narrower than the general sweep script. It reads a model
 shape from ``configs/moe_model_shapes.json``, varies N = B*T, appends profiler
-records to one result folder, and writes one dashboard image for the first-cut
-metrics.
+records to one result folder, and writes graph images with explicit names for
+the selected run view.
 """
 
 from __future__ import annotations
@@ -17,8 +17,11 @@ from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import Iterable
 
-from moe_profile.run_fields import MOE_OP_FIELDS
+from moe_profile.config import DMOE_BF16_ONLY_DTYPE_POLICY, resolve_backend_dtype
+from moe_profile.run_paths import validate_result_root
+from moe_profile.run_fields import MOE_OP_FIELDS, MOE_SEMANTIC_FIELDS
 from moe_profile.run_plots import save_moe_op_dashboard
+from moe_profile.verification import run_nanojax_correctness_gate
 
 
 DEFAULT_TOKENS = "512,1024,2048,4096,8192,16384,32768,65536,131072"
@@ -33,6 +36,8 @@ SUMMARY_FIELDS = (
     "checkpoint_block_index",
     "device",
     "dtype",
+    "requested_dtype",
+    "dtype_policy",
     "batch_size",
     "seq_len",
     "tokens",
@@ -44,6 +49,7 @@ SUMMARY_FIELDS = (
     "shared_expert_intermediate_size",
     "expert_type",
     "activation",
+    *MOE_SEMANTIC_FIELDS,
     "bias_semantics",
     "expert_bias_max_abs",
     "mean_forward_ms",
@@ -126,7 +132,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "auto uses expert_path for MegaBlocks and moe_layer for reference. "
             "moe_layer is the full MoE layer; expert_path is the prepared "
-            "MegaBlocks dispatch/expert/combine path."
+            "MegaBlocks expert block: dispatch/sort/binning, gather, expert MLP, "
+            "and weighted scatter/combine."
         ),
     )
     parser.add_argument(
@@ -139,14 +146,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-block-index", type=int, default=0)
     parser.add_argument("--outlier-abs-threshold", type=float, default=1e-3)
     parser.add_argument("--append", action="store_true")
-    parser.add_argument("--skip-check-output", action="store_true")
+    parser.add_argument(
+        "--row-check-output",
+        action="store_true",
+        help="Also run dense reference output checks for each performance row. The correctness gate is the default check.",
+    )
+    parser.add_argument(
+        "--skip-check-output",
+        action="store_true",
+        help="Deprecated compatibility flag; row checks are already off unless --row-check-output is set.",
+    )
+    parser.add_argument(
+        "--skip-correctness-gate",
+        "--no-verify",
+        dest="skip_correctness_gate",
+        action="store_true",
+        help="Skip the small-N NanoJAX correctness gate for quick exploratory runs.",
+    )
+    parser.add_argument(
+        "--correctness-batch-size",
+        type=int,
+        default=4,
+        help="Batch size for the mandatory small-N NanoJAX correctness gate.",
+    )
+    parser.add_argument(
+        "--correctness-seq-len",
+        type=int,
+        default=0,
+        help="Sequence length for the correctness gate; 0 uses the run sequence length.",
+    )
+    parser.add_argument(
+        "--correctness-fp32-threshold",
+        type=float,
+        default=1e-3,
+        help="Max absolute error tolerance for the FP32 megablocks_moe correctness gate.",
+    )
+    parser.add_argument(
+        "--correctness-bf16-threshold",
+        type=float,
+        default=0.02,
+        help="Max absolute error tolerance for the BF16-only megablocks_dmoe correctness gate.",
+    )
     parser.add_argument("--phase-profile", action="store_true")
     parser.add_argument("--phase-warmup", type=int, default=5)
     parser.add_argument("--phase-iters", type=int, default=20)
     parser.add_argument(
         "--moe-op-profile",
         action="store_true",
-        help="Collect logical MoE-layer op timings and write graphs_moe_ops.png.",
+        help="Collect logical MoE-layer op timings and write graphs_moe_layer_ops.png.",
     )
     parser.add_argument("--moe-op-warmup", type=int, default=5)
     parser.add_argument("--moe-op-iters", type=int, default=20)
@@ -154,6 +201,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-memory-preflight", action="store_true")
     parser.add_argument("--memory-preflight-fraction", type=float, default=0.90)
     parser.add_argument("--memory-preflight-safety-multiplier", type=float, default=1.35)
+    parser.add_argument(
+        "--allow-current-results",
+        action="store_true",
+        help="Allow writing directly under results/current. Normally promotion is manual after review.",
+    )
+    parser.add_argument(
+        "--allow-results-smoke",
+        action="store_true",
+        help="Allow smoke/test/debug result roots under results/. Prefer /tmp for smoke checks.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -237,10 +294,24 @@ def group_points(rows: Iterable[dict], metric: str) -> dict[str, list[tuple[floa
     for row in rows:
         if row.get(metric) is None:
             continue
-        grouped[str(row.get("backend_variant", row.get("backend", "unknown")))].append(
+        grouped[series_label(row)].append(
             (float(row["tokens"]), float(row[metric])),
         )
     return {name: sorted(points) for name, points in sorted(grouped.items())}
+
+
+def series_label(row: dict) -> str:
+    """Presentation label that keeps backend dtype visible in mixed runs."""
+
+    backend = str(row.get("backend_variant", row.get("backend", "unknown")))
+    dtype = row.get("dtype")
+    policy = row.get("dtype_policy")
+    suffix = f" [{dtype}]" if dtype else ""
+    if policy == DMOE_BF16_ONLY_DTYPE_POLICY:
+        suffix += " (BF16-only dMoE)"
+    elif policy and policy not in {"", "requested"}:
+        suffix += f" ({policy})"
+    return backend + suffix
 
 
 def simulation_caveat(simulation_level: object) -> str:
@@ -278,28 +349,25 @@ def save_dashboard(rows: list[dict], shape: dict, out_path: Path) -> None:
         ax.legend()
 
     model_name = rows[0].get("model_shape_name", "unknown")
-    timing_by_backend = {
-        str(row.get("backend_variant", row.get("backend", "unknown"))): str(row.get("timing_scope", "unknown"))
-        for row in rows
-    }
-    timing_text = ", ".join(
-        f"{backend}={timing}" for backend, timing in sorted(timing_by_backend.items())
-    )
-    subtitle = (
-        f"{model_name} | {rows[0].get('simulation_level')} | "
-        f"D={shape['hidden_size']} H={shape['expert_intermediate_size']} "
-        f"E={shape['num_routed_experts']} K={shape['num_experts_per_token']} "
-        f"S={shape.get('num_shared_experts', 0)} "
-        f"{shape['expert_type']}/{shape['activation']} "
-        f"dtype={rows[0].get('dtype')} "
-        f"weights={rows[0].get('weight_source', 'unknown')}\n"
-        f"timing: {timing_text}"
-    )
+    dtype_text = ", ".join(sorted({str(row.get("dtype", "unknown")) for row in rows}))
+    requested_dtype_text = ", ".join(sorted({str(row.get("requested_dtype", row.get("dtype", "unknown"))) for row in rows}))
+    weight_text = ", ".join(sorted({str(row.get("weight_source", "unknown")) for row in rows}))
+    timing_text = ", ".join(sorted({str(row.get("timing_scope", "unknown")) for row in rows}))
+    subtitle_lines = [
+        f"{model_name} | {rows[0].get('simulation_level')}",
+        (
+            f"D={shape['hidden_size']} H={shape['expert_intermediate_size']} "
+            f"E={shape['num_routed_experts']} K={shape['num_experts_per_token']} "
+            f"S={shape.get('num_shared_experts', 0)} {shape['expert_type']}/{shape['activation']}"
+        ),
+        f"requested_dtype={requested_dtype_text} | effective_dtype={dtype_text} | weights={weight_text}",
+        f"timing_scope={timing_text}",
+    ]
     caveat = simulation_caveat(rows[0].get("simulation_level"))
     if caveat:
-        subtitle = f"{subtitle}\n{caveat}"
-    fig.suptitle(f"Model Token-Capacity Sweep\n{subtitle}", fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.87 if caveat else 0.90))
+        subtitle_lines.append(caveat)
+    fig.suptitle("Model Token-Capacity Sweep\n" + "\n".join(subtitle_lines), fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.80 if caveat else 0.83))
     fig.savefig(out_path, dpi=170)
     plt.close(fig)
 
@@ -368,10 +436,12 @@ def write_notes(
     shape: dict,
     rows: list[dict],
     failures: list[str],
+    weight_source: str,
+    requested_dtype: str,
 ) -> None:
     max_by_backend: dict[str, int] = {}
     for row in rows:
-        backend = str(row.get("backend_variant", row.get("backend", "unknown")))
+        backend = series_label(row)
         max_by_backend[backend] = max(max_by_backend.get(backend, 0), int(row["tokens"]))
 
     lines = [
@@ -379,21 +449,29 @@ def write_notes(
         "",
         f"model_shape_name: `{args.model_shape_name}`",
         f"simulation_level: `{shape.get('simulation_level')}`",
-        f"weight_source: `{args.weight_source}`",
-        f"dtype: `{args.dtype or shape['dtype']}`",
+        f"weight_source: `{weight_source}`",
+        f"requested_dtype: `{requested_dtype}`",
         "",
     ]
-    if args.weight_source == "trained_nano_checkpoint":
+    if weight_source == "trained_nano_checkpoint":
         lines.extend([
             f"checkpoint_dir: `{args.checkpoint_dir}`",
             f"checkpoint_block_index: `{args.checkpoint_block_index}`",
             "",
         ])
     lines.extend([
-        f"check_output: `{not args.skip_check_output and shape.get('simulation_level') == 'exact_adapter'}`",
-        f"outlier_abs_threshold: `{args.outlier_abs_threshold}`",
+        f"correctness_gate: `{not args.skip_correctness_gate}`",
+        f"row_check_output: `{args.row_check_output and not args.skip_check_output}`",
+        f"row_check_outlier_abs_threshold: `{args.outlier_abs_threshold}`",
         "",
     ])
+    if shape.get("simulation_level") == "exact_adapter":
+        lines.extend([
+            "NanoJAX correctness is checked once before the sweep and recorded in",
+            "`verification_summary.json` and `verification_summary.md`. Performance",
+            "rows do not run dense reference checks unless `--row-check-output` is set.",
+            "",
+        ])
     caveat = simulation_caveat(shape.get("simulation_level"))
     if caveat:
         lines.extend([
@@ -419,19 +497,30 @@ def write_notes(
         "This sweep varies `N = B*T`, the number of input-token hidden rows at one MoE layer.",
         "It is not generated output tokens per second.",
         "",
-        "The dashboard shows:" if args.plot_mode == "phase_profile" else "The first-cut dashboard shows:",
+        "Primary graph:",
         "",
     ])
     if args.plot_mode == "phase_profile":
         lines.extend([
+            "- `graphs_expert_path_phases.png`",
             "- phase timings for MegaBlocks routing metadata, gather, expert MLP, and scatter.",
             "",
             "Phase timings are independent diagnostic replays of MegaBlocks operations.",
             "Use them to explain bottlenecks, not as an exact additive breakdown of",
             "`mean_forward_ms`.",
         ])
+    elif args.moe_op_profile:
+        lines.extend([
+            "- `graphs_moe_layer_ops.png`",
+            "- disjoint replay timings for the logical MoE-layer blocks.",
+            "",
+            "Use this graph to explain where the MoE-layer replay spends time.",
+            "Use `mean_forward_ms` in `summary.csv` for authoritative production",
+            "latency.",
+        ])
     else:
         lines.extend([
+            "- `graphs_token_capacity.png`",
             "- `mean_forward_ms`: average timed forward call for the selected timing scope.",
             "- `ms_per_input_token`: `mean_forward_ms / N`.",
             "- `active_expert_tflops_per_second`: useful active expert math normalized by runtime.",
@@ -440,12 +529,37 @@ def write_notes(
     if args.phase_profile and args.plot_mode != "phase_profile":
         lines.extend([
             "",
-            "This result also includes `phase_dashboard.png` and phase columns in",
-            "`summary.csv`. Phase timings are independent diagnostic replays of",
-            "MegaBlocks operations, so use them to explain bottlenecks rather than",
-            "as an exact additive breakdown of `mean_forward_ms`.",
+            "This result also includes `graphs_expert_path_phases.png` and phase",
+            "columns in `summary.csv`. Phase timings are independent diagnostic",
+            "replays of MegaBlocks operations, so use them to explain bottlenecks",
+            "rather than as an exact additive breakdown of `mean_forward_ms`.",
+        ])
+    if args.moe_op_profile:
+        lines.extend([
+            "",
+            "MoE-layer op diagnostics:",
+            "",
+            "This result includes `graphs_moe_layer_ops.png` and `moe_op_*` columns.",
+            "Those fields are disjoint diagnostic replays of logical MoE blocks:",
+            "input layout, router projection matmul, full row-wise router softmax,",
+            "top-k expert selection, row-wise selected-gate softmax, aux/router",
+            "bookkeeping, expert block, and output layout.",
+            "The expert block is MegaBlocks dispatch/sort/binning, gather, expert",
+            "MLP compute, and weighted scatter/combine. Gate multiply and reduce",
+            "back to token rows are folded into weighted scatter/combine.",
+            "The component sum and whole replay are reported for sanity checking,",
+            "but the authoritative layer latency remains `mean_forward_ms`.",
         ])
     lines.extend([
+        "",
+        "Dtype policy:",
+        "",
+        "The run-level NanoJAX dtype defaults to the model-shape catalog dtype.",
+        "For `megablocks_dmoe`, the local grouped GEMM extension is BF16-only,",
+        "so dMoE rows may use `dtype=bfloat16` with",
+        "`dtype_policy=dmoe_bf16_only_local_grouped_gemm` even when the requested",
+        "NanoJAX dtype is FP32.",
+        "",
         "",
         "Backend success, failure, and unsupported status is recorded in `backend_status.md`.",
         "",
@@ -464,7 +578,7 @@ def write_notes(
 def write_backend_status(path: Path, rows: list[dict], failures: list[str], requested_backends: list[str]) -> None:
     max_by_backend: dict[str, int] = {}
     for row in rows:
-        backend = str(row.get("backend_variant", row.get("backend", "unknown")))
+        backend = series_label(row)
         max_by_backend[backend] = max(max_by_backend.get(backend, 0), int(row["tokens"]))
 
     lines = [
@@ -497,33 +611,62 @@ def main() -> None:
     dtype = args.dtype or str(shape["dtype"])
     weight_source = args.weight_source
     if weight_source == "auto":
-        weight_source = "nano_jax_init" if simulation_level == "exact_adapter" else "synthetic"
+        weight_source = "trained_nano_checkpoint" if simulation_level == "exact_adapter" else "synthetic"
     tokens_grid = parse_csv_ints(args.tokens)
     backends = parse_csv_strings(args.backends)
+    validate_result_root(
+        args.result_root,
+        allow_current_results=args.allow_current_results,
+        allow_results_smoke=args.allow_results_smoke,
+    )
     result_dir = args.result_root / args.model_shape_name
     result_dir.mkdir(parents=True, exist_ok=True)
 
     raw_path = result_dir / "raw.jsonl"
     summary_path = result_dir / "summary.csv"
-    dashboard_path = result_dir / "dashboard.png"
     token_capacity_dashboard_path = result_dir / "graphs_token_capacity.png"
-    phase_specific_dashboard_path = result_dir / "graphs_phase_profile.png"
-    phase_dashboard_path = result_dir / "phase_dashboard.png"
-    moe_op_dashboard_path = result_dir / "graphs_moe_ops.png"
+    phase_specific_dashboard_path = result_dir / "graphs_expert_path_phases.png"
+    moe_op_dashboard_path = result_dir / "graphs_moe_layer_ops.png"
+    legacy_graph_paths = (
+        result_dir / "dashboard.png",
+        result_dir / "phase_dashboard.png",
+        result_dir / "graphs_phase_profile.png",
+        result_dir / "graphs_moe_ops.png",
+    )
     config_path = result_dir / "config.json"
     notes_path = result_dir / "notes.md"
     backend_status_path = result_dir / "backend_status.md"
 
     if raw_path.exists() and not args.append and not args.dry_run:
         raw_path.unlink()
+        for stale_graph_path in legacy_graph_paths:
+            if stale_graph_path.exists():
+                stale_graph_path.unlink()
+        if args.plot_mode == "phase_profile" and token_capacity_dashboard_path.exists():
+            token_capacity_dashboard_path.unlink()
+        if args.plot_mode != "phase_profile" and phase_specific_dashboard_path.exists():
+            phase_specific_dashboard_path.unlink()
+        if args.moe_op_profile and token_capacity_dashboard_path.exists():
+            token_capacity_dashboard_path.unlink()
+        if not args.moe_op_profile and moe_op_dashboard_path.exists():
+            moe_op_dashboard_path.unlink()
 
     run_config = {
         "model_shape_name": args.model_shape_name,
         "model_shapes_config": str(args.model_shapes_config),
+        "result_root": str(args.result_root),
+        "result_dir": str(result_dir),
+        "result_layout": "result_root/model_shape_name",
+        "graph_outputs": {
+            "token_capacity": str(token_capacity_dashboard_path),
+            "expert_path_phases": str(phase_specific_dashboard_path),
+            "moe_layer_ops": str(moe_op_dashboard_path),
+        },
         "tokens": tokens_grid,
         "seq_len": seq_len,
         "backends": backends,
         "dtype": dtype,
+        "requested_dtype": dtype,
         "device": args.device,
         "warmup": args.warmup,
         "iters": args.iters,
@@ -534,6 +677,12 @@ def main() -> None:
         "checkpoint_block_index": args.checkpoint_block_index if weight_source == "trained_nano_checkpoint" else None,
         "outlier_abs_threshold": args.outlier_abs_threshold,
         "skip_check_output": args.skip_check_output,
+        "row_check_output": args.row_check_output,
+        "skip_correctness_gate": args.skip_correctness_gate,
+        "correctness_batch_size": args.correctness_batch_size,
+        "correctness_seq_len": args.correctness_seq_len or seq_len,
+        "correctness_fp32_threshold": args.correctness_fp32_threshold,
+        "correctness_bf16_threshold": args.correctness_bf16_threshold,
         "phase_profile": args.phase_profile,
         "moe_op_profile": args.moe_op_profile,
         "plot_mode": args.plot_mode,
@@ -570,6 +719,27 @@ def main() -> None:
     print(f"backends={backends}")
 
     profile_script = Path(__file__).with_name("profile_moe_layer.py")
+    run_nanojax_correctness_gate(
+        result_dir=result_dir,
+        profile_script=profile_script,
+        model_shape_name=args.model_shape_name,
+        model_shapes_config=args.model_shapes_config,
+        shape=shape,
+        requested_backends=backends,
+        weight_source=weight_source,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_block_index=args.checkpoint_block_index,
+        nano_jax_dir=args.nano_jax_dir,
+        device=args.device,
+        seed=args.seed,
+        verification_batch_size=args.correctness_batch_size,
+        verification_seq_len=args.correctness_seq_len or seq_len,
+        fp32_threshold=args.correctness_fp32_threshold,
+        bf16_threshold=args.correctness_bf16_threshold,
+        dry_run=args.dry_run,
+        skip=args.skip_correctness_gate,
+    )
+
     failures: list[str] = []
     for tokens in tokens_grid:
         if tokens % seq_len != 0:
@@ -577,11 +747,12 @@ def main() -> None:
             continue
         batch_size = tokens // seq_len
         for backend in backends:
+            effective_dtype, dtype_policy = resolve_backend_dtype(backend, dtype)
             label = (
                 f"{args.model_shape_name}_{backend}_{label_value(args.device)}_"
-                f"tok{tokens}_t{seq_len}_{dtype}_{weight_source}"
+                f"tok{tokens}_t{seq_len}_{effective_dtype}_{weight_source}"
             )
-            check_output = not args.skip_check_output and simulation_level == "exact_adapter"
+            check_output = args.row_check_output and not args.skip_check_output and simulation_level == "exact_adapter"
             cmd = [
                 sys.executable,
                 str(profile_script),
@@ -603,7 +774,11 @@ def main() -> None:
                 "--top-k",
                 str(shape["num_experts_per_token"]),
                 "--dtype",
+                effective_dtype,
+                "--requested-dtype",
                 dtype,
+                "--dtype-policy",
+                dtype_policy,
                 "--device",
                 args.device,
                 "--warmup",
@@ -655,7 +830,7 @@ def main() -> None:
                 "--memory-preflight-safety-multiplier",
                 str(args.memory_preflight_safety_multiplier),
             ])
-            print(f"N={tokens} B={batch_size} backend={backend}")
+            print(f"N={tokens} B={batch_size} backend={backend} dtype={effective_dtype}")
             if args.dry_run or args.verbose:
                 print(" ".join(cmd))
             if args.dry_run:
@@ -687,30 +862,48 @@ def main() -> None:
     rows = load_rows(raw_path)
     if not args.dry_run:
         write_summary_csv(rows, summary_path)
+        wrote_token_capacity_graph = False
+        wrote_phase_graph = False
         if args.plot_mode == "phase_profile":
-            save_phase_dashboard(rows, dashboard_path)
             save_phase_dashboard(rows, phase_specific_dashboard_path)
-            if phase_dashboard_path.exists():
-                phase_dashboard_path.unlink()
+            wrote_phase_graph = True
+        elif args.moe_op_profile:
+            # A MoE-op diagnostic run should not also emit a token-capacity graph
+            # by default; that made retained per-op folders look like duplicate
+            # token-capacity runs. Run a token-capacity sweep separately when that
+            # is the desired view.
+            pass
         else:
-            save_dashboard(rows, shape, dashboard_path)
             save_dashboard(rows, shape, token_capacity_dashboard_path)
-            if phase_dashboard_path.exists():
-                phase_dashboard_path.unlink()
+            wrote_token_capacity_graph = True
         if args.moe_op_profile:
             save_moe_op_dashboard(
                 rows,
                 moe_op_dashboard_path,
                 x_key="tokens",
                 series_key="backend_variant",
-                title="MoE Layer Operation Profile",
+                title=(
+                    "MoE Layer Operation Profile\n"
+                    f"{args.model_shape_name} | requested_dtype={dtype} | weights={weight_source}"
+                ),
             )
-        write_notes(path=notes_path, args=args, shape=shape, rows=rows, failures=failures)
+        write_notes(
+            path=notes_path,
+            args=args,
+            shape=shape,
+            rows=rows,
+            failures=failures,
+            weight_source=weight_source,
+            requested_dtype=dtype,
+        )
         write_backend_status(backend_status_path, rows, failures, backends)
         print(f"summary_csv={summary_path}")
-        print(f"dashboard={dashboard_path}")
+        if wrote_phase_graph:
+            print(f"expert_path_phase_graph={phase_specific_dashboard_path}")
+        if wrote_token_capacity_graph:
+            print(f"token_capacity_graph={token_capacity_dashboard_path}")
         if args.moe_op_profile:
-            print(f"moe_op_dashboard={moe_op_dashboard_path}")
+            print(f"moe_layer_ops_graph={moe_op_dashboard_path}")
         print(f"notes={notes_path}")
         print(f"backend_status={backend_status_path}")
 

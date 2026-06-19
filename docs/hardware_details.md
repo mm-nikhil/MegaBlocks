@@ -83,8 +83,13 @@ gate multiply
 combine / reduce back to [N x D]
 ```
 
-This is the `adapter_boundary` timing scope in our profiling code. It is the
-right default for presentation because it matches the whole MoE layer diagram.
+This is the `moe_layer` timing scope in our profiling code. It is the right
+default for presentation because it matches the whole MoE layer diagram.
+
+The timed MegaBlocks path keeps NanoJAX MoE semantics fixed: router choices and
+gates are computed with NanoJAX-compatible math, then the selected experts are
+executed by MegaBlocks through sparse dispatch, expert MLP compute, and weighted
+scatter/combine.
 
 ## Per-Op Timing Diagnostics
 
@@ -95,29 +100,26 @@ metric and should be used only to explain where MoE-layer time is going.
 The diagram-level timing labels are:
 
 ```text
+moe_op_input_layout_to_megablocks_ms
 moe_op_router_projection_matmul_ms
+moe_op_router_full_softmax_ms
 moe_op_topk_selection_ms
 moe_op_selected_softmax_gating_ms
-moe_op_expert_block_dispatch_compute_combine_ms
-moe_op_gate_multiply_combine_ms
+moe_op_router_aux_loss_ms
+moe_op_expert_path_dispatch_compute_combine_ms
 moe_op_output_layout_to_nano_ms
+moe_op_disjoint_replay_sum_ms
+moe_op_whole_moe_layer_replay_ms
+moe_op_replay_sum_minus_whole_ms
 ```
 
-These are independent replays, not a strict additive decomposition of
-`mean_forward_ms`. In particular:
-
-```text
-moe_op_expert_block_dispatch_compute_combine_ms
-```
-
-times the whole MegaBlocks expert path for selected experts, while:
-
-```text
-moe_op_gate_multiply_combine_ms
-```
-
-times the weighted scatter/combine subset. Do not add the gate/combine subset to
-the expert-block timing as if they were disjoint phases.
+These fields are a disjoint diagnostic replay of logical MoE blocks. The
+component sum is reported, and a whole replay is also reported, but neither
+replaces the authoritative production timing in `mean_forward_ms`. The
+MegaBlocks expert path is kept as one implementation unit:
+dispatch/sort/binning/gather, expert MLP, weighted scatter/combine, and shared
+expert combine if configured. Lower-level gather/MLP/scatter timings belong to
+the separate implementation phase profile.
 
 ## Useful Work
 
