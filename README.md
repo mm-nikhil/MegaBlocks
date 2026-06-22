@@ -36,7 +36,11 @@ The current docs are split by purpose:
 - `docs/hardware_details.md`: clock-derived MoE compute-utilization metric and hardware assumptions.
 - `docs/next_steps.md`: completed work and next actions.
 
-Start with:
+Start with the main analysis document:
+
+- `docs/megablocks_performance_analysis.md`
+
+Then run:
 
 ```bash
 source .venv/bin/activate
